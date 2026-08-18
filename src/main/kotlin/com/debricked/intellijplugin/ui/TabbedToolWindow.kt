@@ -1555,9 +1555,10 @@ private class VulnerabilityDetailsPanel(
     private val scanLabel = JBLabel("").apply { foreground = JBColor.GRAY }
     private val detailsStatusLabel = JBLabel("").apply { foreground = JBColor.GRAY }
     private val scoresArea = createDetailsArea()
+    private val scoreLabels = (0..5).map { JBLabel("") }
     private val advisoryCardsPanel = JPanel(GridLayout(1, 3, JBUI.scale(12), 0)).apply {
         isOpaque = false
-        alignmentX = LEFT_ALIGNMENT
+        alignmentX = TOP_ALIGNMENT
     }
     private val cweCard = createAdvisoryCard("CWE")
     private val githubCard = createAdvisoryCard("GitHub")
@@ -1639,13 +1640,21 @@ private class VulnerabilityDetailsPanel(
                 add(discoveredValueLabel)
             }
             val scoresPanel = JPanel().apply {
-                layout = BoxLayout(this, BoxLayout.Y_AXIS)
+                layout = GridLayout(2, 3, JBUI.scale(8), JBUI.scale(4))
                 isOpaque = false
-                add(JBLabel("CVSS summary").apply {
-                    font = font.deriveFont(Font.BOLD, 16f)
-                })
-                add(Box.createVerticalStrut(4))
-                add(scoresArea)
+                alignmentX = TOP_ALIGNMENT
+                for (i in 0..2) {
+                    add(scoreLabels[i].apply {
+                        horizontalAlignment = SwingConstants.CENTER
+                        font = font.deriveFont(Font.BOLD, 16f)
+                    })
+                }
+                for (i in 3..5) {
+                    add(scoreLabels[i].apply {
+                        horizontalAlignment = SwingConstants.CENTER
+                        font = font.deriveFont(Font.PLAIN, 10f)
+                    })
+                }
             }
             add(leftPanel)
             add(discoveredPanel)
@@ -1948,15 +1957,18 @@ private class VulnerabilityDetailsPanel(
     }
 
     private fun createAdvisoryCard(sourceName: String): AdvisoryCard {
-        val subtitleLabel = JBLabel("$sourceName advisory").apply {
+        val subtitleLabel = JBLabel().apply {
             font = font.deriveFont(Font.BOLD)
             alignmentX = LEFT_ALIGNMENT
         }
-        val bodyArea = createDetailsArea()
-        val linkLabel = JBLabel("No advisory link available").apply {
-            foreground = JBColor.GRAY
+        val bodyArea = createDetailsArea().apply {
+            font = font.deriveFont(Font.PLAIN, 11f)
+        }
+        val linkLabel = JBLabel("").apply {
+            foreground = JBColor.BLUE
             cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
             alignmentX = LEFT_ALIGNMENT
+            isVisible = false
         }
         val moreDetailsButton = JButton("More details").apply {
             alignmentX = LEFT_ALIGNMENT
@@ -1969,16 +1981,8 @@ private class VulnerabilityDetailsPanel(
                 JBUI.Borders.customLine(JBColor.border()),
                 JBUI.Borders.empty(8)
             )
-            add(JPanel(BorderLayout()).apply {
-                isOpaque = false
-                add(subtitleLabel, BorderLayout.WEST)
-                if (sourceName == "GitHub" || sourceName == "NVD") {
-                    add(JBLabel("🔗").apply {
-                        border = JBUI.Borders.emptyLeft(4)
-                        font = font.deriveFont(12f)
-                    }, BorderLayout.EAST)
-                }
-            })
+            alignmentY = TOP_ALIGNMENT
+            add(subtitleLabel)
             add(Box.createVerticalStrut(6))
             add(bodyArea)
             add(Box.createVerticalStrut(6))
@@ -1990,10 +1994,21 @@ private class VulnerabilityDetailsPanel(
     }
 
     private fun buildCompactScoreSummaryText(scoreSummaries: List<VulnerabilityScoreSummary>): String {
-        if (scoreSummaries.isEmpty()) return ""
-        return scoreSummaries.joinToString("\n") { score ->
-            "${score.category}: ${score.scoreText}${score.label.takeIf { it.isNotBlank() }?.let { " (${it})" } ?: ""}"
+        val cvss = mutableMapOf("CVSS4" to (null as VulnerabilityScoreSummary?), "CVSS3" to null, "CVSS2" to null)
+        scoreSummaries.forEach { score ->
+            if (cvss.containsKey(score.category)) {
+                cvss[score.category] = score
+            }
         }
+        
+        scoreLabels[0].text = cvss["CVSS4"]?.scoreText ?: "N/A"
+        scoreLabels[1].text = cvss["CVSS3"]?.scoreText ?: "N/A"
+        scoreLabels[2].text = cvss["CVSS2"]?.scoreText ?: "N/A"
+        scoreLabels[3].text = "CVSS4"
+        scoreLabels[4].text = "CVSS3"
+        scoreLabels[5].text = "CVSS2"
+        
+        return ""
     }
 
     private fun renderSummarySources(summarySources: List<VulnerabilitySummarySource>) {
@@ -2005,30 +2020,16 @@ private class VulnerabilityDetailsPanel(
 
     private fun bindCweCard(source: VulnerabilitySummarySource?) {
         val description = source?.description?.trim().orEmpty()
-        cweCard.fullText = buildString {
-            if (source == null) {
-                append("No CWE summary available.")
-            } else {
-                if (source.title.isNotBlank()) {
-                    append(source.title.trim())
-                } else {
-                    append("CWE summary")
-                }
-                if (description.isNotBlank()) {
-                    append("\n\n")
-                    append(description)
-                }
-            }
-        }
+        cweCard.fullText = description.ifBlank { "No CWE summary available." }
         cweCard.expanded = false
         cweCard.linkTarget = source?.link?.takeIf { it.isNotBlank() }
-        cweCard.subtitleLabel.text = source?.title?.takeIf { it.isNotBlank() } ?: "CWE summary"
-        cweCard.linkLabel.text = cweCard.linkTarget?.let { "Open in CWE reference" } ?: "No external link available"
+        val title = source?.title?.takeIf { it.isNotBlank() } ?: "CWE"
+        cweCard.subtitleLabel.text = title
+        cweCard.linkLabel.text = "View reference"
         cweCard.linkLabel.isEnabled = cweCard.linkTarget != null
-        cweCard.linkLabel.foreground = if (cweCard.linkTarget == null) JBColor.GRAY else JBColor.BLUE
-        cweCard.linkLabel.toolTipText = cweCard.linkTarget
+        cweCard.linkLabel.isVisible = cweCard.linkTarget != null
         cweCard.moreDetailsButton.isEnabled = cweCard.fullText.length > ADVISORY_PREVIEW_LENGTH
-        cweCard.moreDetailsButton.text = if (cweCard.moreDetailsButton.isEnabled) "More details" else "Details unavailable"
+        cweCard.moreDetailsButton.text = if (cweCard.moreDetailsButton.isEnabled) "More details" else ""
         updateAdvisoryCardBody(cweCard)
     }
 
@@ -2036,13 +2037,14 @@ private class VulnerabilityDetailsPanel(
         card.fullText = source?.description?.trim().orEmpty()
         card.expanded = false
         card.linkTarget = source?.link?.takeIf { it.isNotBlank() }
-        card.subtitleLabel.text = source?.title?.takeIf { it.isNotBlank() } ?: "${card.sourceName} advisory"
-        card.linkLabel.text = card.linkTarget?.let { "Open in ${card.sourceName}" } ?: "No advisory link available"
+        val title = source?.title?.takeIf { it.isNotBlank() } ?: "${card.sourceName} advisory"
+        val titleWithIcon = if (card.linkTarget != null) "$title 🔗" else title
+        card.subtitleLabel.text = titleWithIcon
+        card.linkLabel.text = "View on ${card.sourceName}"
         card.linkLabel.isEnabled = card.linkTarget != null
-        card.linkLabel.foreground = if (card.linkTarget == null) JBColor.GRAY else JBColor.BLUE
-        card.linkLabel.toolTipText = card.linkTarget
+        card.linkLabel.isVisible = card.linkTarget != null
         card.moreDetailsButton.isEnabled = card.fullText.length > ADVISORY_PREVIEW_LENGTH
-        card.moreDetailsButton.text = if (card.moreDetailsButton.isEnabled) "More details" else "Details unavailable"
+        card.moreDetailsButton.text = if (card.moreDetailsButton.isEnabled) "More details" else ""
         updateAdvisoryCardBody(card)
     }
 
