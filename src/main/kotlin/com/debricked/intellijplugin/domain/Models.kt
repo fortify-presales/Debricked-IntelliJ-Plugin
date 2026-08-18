@@ -55,17 +55,34 @@ data class DebrickedScanContext(
 
 data class VulnerabilityFinding(
     val id: String,
+    val vulnerabilityId: String? = null,
+    val debrickedCommitId: String? = null,
+    val title: String? = null,
     val ecosystem: Ecosystem,
     val packageName: String,
     val groupId: String?,
     val version: String,
+    val affectedDependencies: List<AffectedDependency> = emptyList(),
     val severity: Severity,
     val fixedVersion: String?,
     val description: String?,
     val scanContext: DebrickedScanContext,
     val affectedFiles: List<String> = emptyList(),
     val cveId: String? = null,
-    val exploitabilityScore: Double? = null
+    val reviewStatus: String? = null,
+    val pausedUntil: String? = null,
+    val introducedAt: Long? = null,
+    val reachablePath: String? = null,
+    val reachabilityMessage: String? = null,
+    val exploited: Boolean? = null,
+    val exploitabilityScore: Double? = null,
+    val cvss2Score: Double? = null,
+    val cvss3Score: Double? = null
+)
+
+data class AffectedDependency(
+    val name: String,
+    val version: String? = null
 )
 
 enum class FindingConfidence {
@@ -98,3 +115,135 @@ enum class FindingsState {
     STALE_COMMIT,
     NO_REMOTE_RESULTS
 }
+
+data class VulnerabilityQuery(
+    val search: String = "",
+    val page: Int = 1,
+    val rowsPerPage: Int = 25,
+    val sortColumn: String = "cvss",
+    val order: String = "desc"
+)
+
+data class VulnerabilityPageResult(
+    val findings: List<VulnerabilityFinding>,
+    val page: Int,
+    val rowsPerPage: Int,
+    val totalCount: Int? = null,
+    val hasNext: Boolean = false
+)
+
+data class VulnerabilityDetailsContext(
+    val vulnerabilityId: String,
+    val repositoryId: String,
+    val branchName: String? = null,
+    val commitId: String? = null,
+    val title: String? = null,
+    val cveId: String? = null
+)
+
+data class VulnerabilitySummarySource(
+    val key: String,
+    val category: String,
+    val title: String,
+    val description: String,
+    val explanation: String? = null,
+    val link: String? = null,
+    val missing: Boolean = false
+)
+
+data class VulnerabilityScoreSummary(
+    val category: String,
+    val label: String,
+    val scoreText: String,
+    val highlighted: Boolean
+)
+
+data class VulnerabilityDates(
+    val discoveredAt: Long? = null,
+    val publishedAt: Long? = null,
+    val updatedAt: Long? = null
+)
+
+data class VulnerabilityReferenceLink(
+    val title: String,
+    val link: String,
+    val domain: String? = null,
+    val tags: List<String> = emptyList()
+)
+
+data class VulnerabilityFileRef(
+    val id: String,
+    val name: String,
+    val url: String? = null
+)
+
+data class VulnerabilityDependencyTreeNode(
+    val name: String,
+    val version: String? = null,
+    val url: String? = null,
+    val vulnerable: Boolean = false,
+    val children: List<VulnerabilityDependencyTreeNode> = emptyList()
+)
+
+data class VulnerabilityDependencyTree(
+    val fileName: String? = null,
+    val fileUrl: String? = null,
+    val roots: List<VulnerabilityDependencyTreeNode> = emptyList()
+)
+
+data class VulnerabilityRepositoryBranch(
+    val id: String,
+    val name: String,
+    val latestCommitId: String? = null,
+    val isVulnerable: Boolean = false
+)
+
+data class VulnerabilityRepositoryStatus(
+    val id: String,
+    val name: String,
+    val link: String? = null,
+    val type: String,
+    val pausedUntil: String? = null,
+    val branches: List<VulnerabilityRepositoryBranch> = emptyList()
+)
+
+data class VulnerabilityReviewStatusInfo(
+    val repositoryStatuses: List<VulnerabilityRepositoryStatus> = emptyList(),
+    val enforceComment: Boolean = false,
+    val commentMinLength: Int? = null,
+    val oldComment: String? = null,
+    val oldCommentAuthor: String? = null
+)
+
+data class VulnerabilityRootFixes(
+    val rootFixesCount: Int = 0,
+    val fixes: Map<String, String> = emptyMap(),
+    val commands: List<String> = emptyList(),
+    val isReady: Boolean = false
+)
+
+data class VulnerabilityReachabilityDetails(
+    val supported: Boolean = true,
+    val reachAnalysisLanguage: String? = null,
+    val reachAnalysisMessage: String? = null,
+    val reachAnalysis: String? = null
+)
+
+data class VulnerabilityCvssDetails(
+    val explanation: String? = null
+)
+
+data class VulnerabilityDetailsBundle(
+    val summarySources: List<VulnerabilitySummarySource> = emptyList(),
+    val scoreSummaries: List<VulnerabilityScoreSummary> = emptyList(),
+    val cvssDetails: VulnerabilityCvssDetails? = null,
+    val dates: VulnerabilityDates = VulnerabilityDates(),
+    val affectedDependencies: List<AffectedDependency> = emptyList(),
+    val files: List<VulnerabilityFileRef> = emptyList(),
+    val dependencyTree: VulnerabilityDependencyTree? = null,
+    val repositoryStatuses: List<VulnerabilityRepositoryStatus> = emptyList(),
+    val reviewStatusInfo: VulnerabilityReviewStatusInfo? = null,
+    val rootFixes: VulnerabilityRootFixes? = null,
+    val references: List<VulnerabilityReferenceLink> = emptyList(),
+    val reachabilityDetails: VulnerabilityReachabilityDetails? = null
+)

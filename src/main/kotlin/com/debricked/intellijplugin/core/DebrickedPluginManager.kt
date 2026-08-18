@@ -15,11 +15,29 @@ class DebrickedPluginManager(private val project: Project) {
     private val LOG = logger<DebrickedPluginManager>()
     private val apiClient = ApplicationManager.getApplication().getService(DebrickedApiClient::class.java)
     private val gitResolver = GitContextResolver(project)
+    private val vulnerabilityCache = VulnerabilityCache()
+    private val refreshLock = Any()
+    @Volatile private var activeRefreshRequest: RefreshRequest? = null
 
     @Volatile private var currentFindings = listOf<VulnerabilityFinding>()
+    @Volatile private var currentPageResult = VulnerabilityPageResult(
+        findings = emptyList(),
+        page = 1,
+        rowsPerPage = 25,
+        totalCount = 0,
+        hasNext = false
+    )
     @Volatile private var currentScanContext: DebrickedScanContext? = null
     @Volatile private var findingsState = FindingsState.NO_REMOTE_RESULTS
     private val listeners = mutableListOf<FindingsUpdateListener>()
+
+    private data class RefreshRequest(
+        val repositoryId: String,
+        val branchId: String?,
+        val branchName: String?,
+        val defaultBranch: String?,
+        val query: VulnerabilityQuery
+    )
 
     init {
         // Subscribe to settings-applied events so the tool window refreshes when the user
@@ -29,64 +47,157 @@ class DebrickedPluginManager(private val project: Project) {
             .subscribe(DebrickedSettingsNotifier.TOPIC, object : DebrickedSettingsNotifier {
                 override fun onSettingsApplied() {
                     LOG.info("Settings applied — refreshing findings")
+                    clearFindingsCache()
                     refreshFindings()
                 }
             })
     }
 
-    fun refreshFindings() {
+    fun refreshFindings(forceRefresh: Boolean = false, query: VulnerabilityQuery = VulnerabilityQuery()) {
         val settings = DebrickedSettingsManager.getInstance()
         val repositoryId = settings.getRepositoryId()
+        val branchId = settings.getSelectedBranchId().ifBlank { null }
+        val branchName = settings.getSelectedBranchName().ifBlank { null }
+        val defaultBranch = settings.getDefaultBranch()?.ifBlank { null }
+        val request = RefreshRequest(repositoryId, branchId, branchName, defaultBranch, query)
 
         if (repositoryId.isEmpty()) {
             currentFindings = emptyList()
+            currentPageResult = VulnerabilityPageResult(
+                findings = emptyList(),
+                page = query.page.coerceAtLeast(1),
+                rowsPerPage = query.rowsPerPage.coerceAtLeast(1),
+                totalCount = 0,
+                hasNext = false
+            )
             findingsState = FindingsState.NO_REMOTE_RESULTS
-            notifyListeners(emptyList(), FindingsState.NO_REMOTE_RESULTS)
+            notifyListeners(currentPageResult, FindingsState.NO_REMOTE_RESULTS)
             return
         }
 
-        // Immediately show LOADING so the tool window clears stale data right away
-        currentFindings = emptyList()
+        synchronized(refreshLock) {
+            if (!forceRefresh && findingsState == FindingsState.LOADING && request == activeRefreshRequest) {
+                return
+            }
+            activeRefreshRequest = request
+        }
+
+        val sameBranch = when {
+            branchName.isNullOrBlank() -> currentScanContext?.branchName.isNullOrBlank()
+            else -> currentScanContext?.branchName?.equals(branchName, ignoreCase = true) == true
+        }
+        val preserveVisibleFindings = currentScanContext?.repositoryId == repositoryId && sameBranch
+        // Keep current findings visible while loading to avoid full UI flicker.
         findingsState = FindingsState.LOADING
-        notifyListeners(emptyList(), FindingsState.LOADING)
+        notifyListeners(
+            if (preserveVisibleFindings) currentPageResult else currentPageResult.copy(findings = emptyList()),
+            FindingsState.LOADING
+        )
 
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
                 val gitContext = gitResolver.resolveGitContext()
-                val findings = resolveFindingsWithFallback(
+                val pageResult = resolveFindingsWithFallback(
                     repositoryId,
-                    gitContext.commitSha,
-                    gitContext.branchName
+                    branchId,
+                    branchName,
+                    defaultBranch,
+                    query,
+                    forceRefresh
                 )
-                currentFindings = findings
-                findingsState = determineFindingsState(findings, gitContext)
-                notifyListeners(findings, findingsState)
+                currentFindings = pageResult.findings
+                currentPageResult = pageResult
+                findingsState = determineFindingsState(pageResult.findings, gitContext)
+                val shouldPublish = synchronized(refreshLock) {
+                    if (activeRefreshRequest == request) {
+                        activeRefreshRequest = null
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (!shouldPublish) {
+                    return@executeOnPooledThread
+                }
+                notifyListeners(pageResult, findingsState)
             } catch (e: Exception) {
                 LOG.error("Failed to refresh findings: ${e.message}", e)
                 currentFindings = emptyList()
+                currentPageResult = VulnerabilityPageResult(
+                    findings = emptyList(),
+                    page = query.page.coerceAtLeast(1),
+                    rowsPerPage = query.rowsPerPage.coerceAtLeast(1),
+                    totalCount = 0,
+                    hasNext = false
+                )
                 findingsState = FindingsState.NO_REMOTE_RESULTS
-                notifyListeners(emptyList(), FindingsState.NO_REMOTE_RESULTS)
+                val shouldPublish = synchronized(refreshLock) {
+                    if (activeRefreshRequest == request) {
+                        activeRefreshRequest = null
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (!shouldPublish) {
+                    return@executeOnPooledThread
+                }
+                notifyListeners(currentPageResult, FindingsState.NO_REMOTE_RESULTS)
             }
         }
     }
 
     private fun resolveFindingsWithFallback(
         repositoryId: String,
-        commitSha: String?,
-        branchName: String?
-    ): List<VulnerabilityFinding> {
-        val findings = apiClient.getVulnerabilities(repositoryId)
+        branchId: String?,
+        branchName: String?,
+        defaultBranch: String?,
+        query: VulnerabilityQuery,
+        forceRefresh: Boolean
+    ): VulnerabilityPageResult {
+        val queryKey = buildQueryKey(query)
+        var resolvedPage = vulnerabilityCache.getOrLoadForQuery(repositoryId, branchId, queryKey, forceRefresh) {
+            apiClient.getVulnerabilitiesPage(repositoryId, branchName = branchId, query = query)
+        }
+        var resolvedBranchName = branchName ?: branchId
+        var fallbackReason: FallbackReason? = null
+
+        val shouldTryDefaultBranch = resolvedPage.findings.isEmpty() &&
+            !defaultBranch.isNullOrBlank() &&
+            !matchesBranch(branchId, branchName, defaultBranch)
+
+        if (shouldTryDefaultBranch) {
+            val fallbackPage = vulnerabilityCache.getOrLoadForQuery(repositoryId, defaultBranch, queryKey, forceRefresh) {
+                apiClient.getVulnerabilitiesPage(repositoryId, branchName = defaultBranch, query = query)
+            }
+            if (fallbackPage.findings.isNotEmpty()) {
+                resolvedPage = fallbackPage
+                resolvedBranchName = defaultBranch
+                fallbackReason = FallbackReason.DEFAULT_BRANCH_USED
+            } else if (!branchId.isNullOrBlank() || !branchName.isNullOrBlank()) {
+                fallbackReason = FallbackReason.BRANCH_NOT_SCANNED
+            }
+        }
+
+        if (resolvedPage.findings.isEmpty() && fallbackReason == null) {
+            fallbackReason = FallbackReason.NO_REMOTE_DATA
+        }
+
         currentScanContext = DebrickedScanContext(
             repositoryId = repositoryId,
             repositoryName = DebrickedSettingsManager.getInstance().getRepositoryName(),
-            branchName = branchName,
-            commitSha = commitSha,
+            branchName = resolvedBranchName,
+            commitSha = null,
             scanId = null,
-            displayedCommitSha = if (findings.isNotEmpty()) commitSha ?: branchName else null,
+            displayedCommitSha = resolvedBranchName,
             isExactCommitMatch = false,
-            fallbackReason = if (findings.isEmpty()) FallbackReason.NO_REMOTE_DATA else null
+            fallbackReason = fallbackReason
         )
-        return findings
+        return resolvedPage
+    }
+
+    private fun matchesBranch(branchId: String?, branchName: String?, candidate: String): Boolean {
+        return branchId.equals(candidate, ignoreCase = true) || branchName.equals(candidate, ignoreCase = true)
     }
 
     private fun determineFindingsState(
@@ -99,15 +210,16 @@ class DebrickedPluginManager(private val project: Project) {
     }
 
     fun getCurrentFindings(): List<VulnerabilityFinding> = currentFindings
+    fun getCurrentPageResult(): VulnerabilityPageResult = currentPageResult
     fun getCurrentScanContext(): DebrickedScanContext? = currentScanContext
     fun getFindingsState(): FindingsState = findingsState
     fun getGitContext(): GitContext = gitResolver.resolveGitContext()
 
-    fun isConfigured(): Boolean {
-        val settings = DebrickedSettingsManager.getInstance()
-        return settings.isConfigured() &&
-            (DebrickedCredentialStore.getAccessToken() != null || DebrickedCredentialStore.getPassword() != null)
-    }
+    fun hasCredentials(): Boolean =
+        DebrickedCredentialStore.getAccessToken() != null || DebrickedCredentialStore.getPassword() != null
+
+    fun isConfigured(): Boolean =
+        DebrickedSettingsManager.getInstance().isConfigured() && hasCredentials()
 
     fun addListener(listener: FindingsUpdateListener) {
         synchronized(listeners) { listeners.add(listener) }
@@ -117,14 +229,32 @@ class DebrickedPluginManager(private val project: Project) {
         synchronized(listeners) { listeners.remove(listener) }
     }
 
-    private fun notifyListeners(findings: List<VulnerabilityFinding>, state: FindingsState) {
+    fun invalidateFindingsCache(repositoryId: String, branchId: String? = null) {
+        vulnerabilityCache.invalidate(repositoryId, branchId)
+    }
+
+    fun clearFindingsCache() {
+        vulnerabilityCache.clear()
+    }
+
+    private fun notifyListeners(pageResult: VulnerabilityPageResult, state: FindingsState) {
         val snapshot = synchronized(listeners) { listeners.toList() }
-        snapshot.forEach { it.onFindingsUpdated(findings, state) }
+        snapshot.forEach { it.onFindingsUpdated(pageResult, state) }
+    }
+
+    private fun buildQueryKey(query: VulnerabilityQuery): String {
+        return listOf(
+            query.search.trim(),
+            query.page.coerceAtLeast(1).toString(),
+            query.rowsPerPage.coerceAtLeast(1).toString(),
+            query.sortColumn.lowercase(),
+            query.order.lowercase()
+        ).joinToString("|")
     }
 
     fun shutdown() {}
 
     interface FindingsUpdateListener {
-        fun onFindingsUpdated(findings: List<VulnerabilityFinding>, state: FindingsState)
+        fun onFindingsUpdated(pageResult: VulnerabilityPageResult, state: FindingsState)
     }
 }

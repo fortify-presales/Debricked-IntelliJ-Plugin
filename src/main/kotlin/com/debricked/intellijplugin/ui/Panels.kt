@@ -1,6 +1,14 @@
 package com.debricked.intellijplugin.ui
 
+import com.debricked.intellijplugin.api.DebrickedApiClient
+import com.debricked.intellijplugin.core.DebrickedPluginManager
 import com.debricked.intellijplugin.domain.*
+import com.debricked.intellijplugin.settings.DebrickedCredentialStore
+import com.debricked.intellijplugin.settings.DebrickedSettingsManager
+import com.intellij.icons.AllIcons
+import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.ModalityState
+import com.intellij.openapi.options.ShowSettingsUtil
 import com.intellij.openapi.project.Project
 import com.intellij.ui.JBColor
 import com.intellij.ui.ColoredTreeCellRenderer
@@ -36,39 +44,200 @@ private object SeverityStyle {
 data class SeverityGroupNode(val severity: Severity, val count: Int)
 data class FindingNode(val finding: VulnerabilityFinding)
 
-/** "Not connected" placeholder shown when no repository/credentials are configured. */
-class NotConfiguredPanel(
+/** Repository identifier used in the toolbar combo. */
+internal data class RepositoryChoice(
+    val id: String,
+    val name: String,
+    val organizationId: String,
+    val defaultBranch: String? = null
+) {
+    override fun toString(): String = name.ifBlank { id }
+}
+
+/**
+ * Repository selector bar — single line across the full width.
+ * Left: "Repository:" label + dropdown + ↺ load-list button + status text.
+ * Right: ↺ refresh-findings + ⚙ settings buttons.
+ */
+class RepositoryBar(
     private val project: Project,
-    private val onRefresh: () -> Unit
+    private val pluginManager: DebrickedPluginManager
 ) : JPanel(BorderLayout()) {
+
+    private val apiClient = ApplicationManager.getApplication().getService(DebrickedApiClient::class.java)
+    private val settings = DebrickedSettingsManager.getInstance()
+
+    private val repoCombo = JComboBox<RepositoryChoice>().apply {
+        preferredSize = Dimension(260, preferredSize.height)
+        renderer = RepositoryComboRenderer()
+        maximumRowCount = 20
+    }
+    private val loadReposButton   = mkIconButton(AllIcons.Actions.Refresh,  "Refresh repository list from Debricked")
+    private val refreshFindingsButton = mkIconButton(AllIcons.Actions.Refresh,  "Refresh vulnerability findings")
+    private val settingsButton    = mkIconButton(AllIcons.General.Settings,  "Open Debricked authentication settings")
+    private val statusLabel = JBLabel("").apply { foreground = JBColor.GRAY }
+
+    // Guard flag — prevents the ActionListener firing during programmatic model updates
+    private var suppressEvents = false
+
     init {
-        border = JBUI.Borders.empty(20)
-        val center = JPanel().apply {
-            layout = BoxLayout(this, BoxLayout.Y_AXIS)
-            add(Box.createVerticalGlue())
-            add(JBLabel("Not Connected to Debricked").apply {
-                font = font.deriveFont(Font.BOLD, 14f)
-                alignmentX = Component.CENTER_ALIGNMENT
-            })
-            add(Box.createVerticalStrut(10))
-            add(JBLabel("Configure your Debricked repository to see vulnerability findings.").apply {
-                alignmentX = Component.CENTER_ALIGNMENT
-                foreground = JBColor.GRAY
-            })
-            add(Box.createVerticalStrut(16))
-            add(JButton("Open Debricked Settings").apply {
-                alignmentX = Component.CENTER_ALIGNMENT
-                addActionListener {
-                    com.intellij.openapi.options.ShowSettingsUtil.getInstance().showSettingsDialog(
-                        project,
-                        com.debricked.intellijplugin.settings.DebrickedSettingsConfigurable::class.java
-                    )
-                    onRefresh()
-                }
-            })
-            add(Box.createVerticalGlue())
+        border = JBUI.Borders.compound(
+            JBUI.Borders.customLine(JBColor.border(), 0, 0, 1, 0),
+            JBUI.Borders.empty(6, 8)
+        )
+
+        repoCombo.addActionListener {
+            if (suppressEvents) return@addActionListener
+            val selected = repoCombo.selectedItem as? RepositoryChoice ?: return@addActionListener
+            if (selected.id == settings.getRepositoryId()) return@addActionListener
+            settings.setRepositoryId(selected.id)
+            settings.setRepositoryName(selected.name)
+            pluginManager.refreshFindings()
         }
-        add(center, BorderLayout.CENTER)
+
+        loadReposButton.addActionListener { loadRepositories() }
+        refreshFindingsButton.addActionListener { pluginManager.refreshFindings() }
+        settingsButton.addActionListener {
+            ShowSettingsUtil.getInstance()
+                .showSettingsDialog(project, com.debricked.intellijplugin.settings.DebrickedSettingsConfigurable::class.java)
+        }
+
+        statusLabel.border = JBUI.Borders.emptyLeft(8)
+
+        add(JPanel(GridBagLayout()).apply {
+            isOpaque = false
+
+            add(JBLabel("Repository:"), GridBagConstraints().apply {
+                gridx = 0
+                gridy = 0
+                anchor = GridBagConstraints.WEST
+                insets = Insets(0, 0, 0, 8)
+            })
+
+            add(repoCombo, GridBagConstraints().apply {
+                gridx = 1
+                gridy = 0
+                weightx = 1.0
+                fill = GridBagConstraints.HORIZONTAL
+            })
+
+            add(statusLabel, GridBagConstraints().apply {
+                gridx = 2
+                gridy = 0
+                anchor = GridBagConstraints.WEST
+                insets = Insets(0, 8, 0, 6)
+            })
+
+            add(loadReposButton, GridBagConstraints().apply {
+                gridx = 3
+                gridy = 0
+                insets = Insets(0, 0, 0, 2)
+            })
+
+            add(refreshFindingsButton, GridBagConstraints().apply {
+                gridx = 4
+                gridy = 0
+                insets = Insets(0, 0, 0, 2)
+            })
+
+            add(settingsButton, GridBagConstraints().apply {
+                gridx = 5
+                gridy = 0
+            })
+        }, BorderLayout.CENTER)
+
+        preloadCurrentRepo()
+    }
+
+    private fun preloadCurrentRepo() {
+        val id = settings.getRepositoryId()
+        val name = settings.getRepositoryName()
+        suppressEvents = true
+        if (id.isNotBlank()) {
+            val model = DefaultComboBoxModel<RepositoryChoice>()
+            model.addElement(RepositoryChoice(id, name.ifBlank { id }, settings.getOrganizationId()))
+            repoCombo.model = model
+            repoCombo.selectedIndex = 0
+            repoCombo.isEnabled = true
+        } else {
+            repoCombo.model = DefaultComboBoxModel()
+            repoCombo.isEnabled = false
+            setStatus("Click ↺ to load repositories")
+        }
+        suppressEvents = false
+    }
+
+    private fun loadRepositories() {
+        val accessToken = DebrickedCredentialStore.getAccessToken() ?: ""
+        val password = DebrickedCredentialStore.getPassword() ?: ""
+        val apiUrl = settings.getApiUrl()
+        val authMethod = settings.getAuthMethod()
+        val username = settings.getUsername()
+
+        loadReposButton.isEnabled = false
+        repoCombo.isEnabled = false
+        setStatus("Loading…")
+
+        Thread({
+            try {
+                val repos = apiClient.connectAndGetRepositories(apiUrl, authMethod, accessToken, username, password)
+                val choices = repos
+                    .filter { it.id.isNotBlank() }
+                    .map { RepositoryChoice(it.id, it.name.ifBlank { it.id }, it.organizationId) }
+                    .sortedBy { it.name.lowercase() }
+
+                ApplicationManager.getApplication().invokeLater({
+                    suppressEvents = true
+                    val model = DefaultComboBoxModel<RepositoryChoice>()
+                    choices.forEach { model.addElement(it) }
+                    repoCombo.model = model
+                    repoCombo.isEnabled = choices.isNotEmpty()
+                    suppressEvents = false
+                    selectCurrentRepo()
+                    loadReposButton.isEnabled = true
+                    setStatus("${choices.size} repos")
+                }, ModalityState.any())
+            } catch (e: Exception) {
+                ApplicationManager.getApplication().invokeLater({
+                    loadReposButton.isEnabled = true
+                    repoCombo.isEnabled = repoCombo.model.size > 0
+                    setStatus("Load failed: ${e.message?.take(60)}")
+                }, ModalityState.any())
+            }
+        }, "debricked-load-repos").apply { isDaemon = true }.start()
+    }
+
+    private fun selectCurrentRepo() {
+        val currentId = settings.getRepositoryId()
+        if (currentId.isBlank()) return
+        val model = repoCombo.model as? DefaultComboBoxModel<RepositoryChoice> ?: return
+        suppressEvents = true
+        for (i in 0 until model.size) {
+            if (model.getElementAt(i).id == currentId) { repoCombo.selectedIndex = i; break }
+        }
+        suppressEvents = false
+    }
+
+    private fun setStatus(text: String) { statusLabel.text = text }
+
+    private fun mkIconButton(icon: javax.swing.Icon, tooltip: String) = JButton(icon).apply {
+        toolTipText = tooltip
+        preferredSize = Dimension(24, 24)
+        minimumSize = preferredSize
+        isBorderPainted = false
+        isContentAreaFilled = false
+        isFocusPainted = false
+        margin = Insets(0, 0, 0, 0)
+    }
+}
+
+private class RepositoryComboRenderer : DefaultListCellRenderer() {
+    override fun getListCellRendererComponent(
+        list: JList<*>?, value: Any?, index: Int, isSelected: Boolean, cellHasFocus: Boolean
+    ): Component {
+        val comp = super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus)
+        if (value == null) { text = "Select a repository…"; foreground = JBColor.GRAY }
+        return comp
     }
 }
 
@@ -79,18 +248,28 @@ class NotConfiguredPanel(
 class DebrickedFindingsPanel(
     private val findings: List<VulnerabilityFinding>,
     private val state: FindingsState,
-    private val context: DebrickedScanContext?
+    @Suppress("unused") private val context: DebrickedScanContext?
 ) : JPanel(BorderLayout()) {
 
     init {
-        add(buildHeader(), BorderLayout.NORTH)
+        border = JBUI.Borders.empty(8)
+        add(buildStatusBar(), BorderLayout.NORTH)
         add(buildContent(), BorderLayout.CENTER)
     }
 
-    private fun buildHeader(): JPanel {
-        val repoText = context?.let { "${it.repositoryName} [${it.repositoryId}]" } ?: "Debricked"
+    private fun buildStatusBar(): JPanel {
+        // Read directly from settings so the status always reflects the selected repo,
+        // even during a LOADING state when context hasn't been updated yet.
+        val settings = DebrickedSettingsManager.getInstance()
+        val repoId = settings.getRepositoryId()
+        val repoName = settings.getRepositoryName()
+        val repoText = when {
+            repoId.isBlank() -> "Debricked"
+            repoName.isBlank() -> "Repository $repoId"
+            else -> "$repoName [$repoId]"
+        }
         val statusText = when (state) {
-            FindingsState.LOADING                  -> "Loading..."
+            FindingsState.LOADING                  -> "Loading…"
             FindingsState.CURRENT                  -> "${findings.size} findings · ${now()}"
             FindingsState.NO_REMOTE_RESULTS        -> "No findings · ${now()}"
             FindingsState.STALE_DEPENDENCY_CHANGES -> "${findings.size} findings · local changes detected"
@@ -99,7 +278,7 @@ class DebrickedFindingsPanel(
         return JPanel(BorderLayout()).apply {
             border = JBUI.Borders.compound(
                 JBUI.Borders.customLine(JBColor.border(), 0, 0, 1, 0),
-                JBUI.Borders.empty(5, 8)
+                JBUI.Borders.empty(6, 10)
             )
             add(JBLabel(repoText).apply { font = font.deriveFont(Font.BOLD) }, BorderLayout.WEST)
             add(JBLabel(statusText).apply { foreground = JBColor.GRAY }, BorderLayout.EAST)
@@ -112,36 +291,20 @@ class DebrickedFindingsPanel(
         else -> buildFindingsTree()
     }
 
-    private fun buildLoadingPanel(): JPanel = JPanel().apply {
-        layout = BoxLayout(this, BoxLayout.Y_AXIS)
-        add(Box.createVerticalGlue())
-        add(JBLabel("Fetching vulnerability data from Debricked…").apply {
-            alignmentX = Component.CENTER_ALIGNMENT
-            foreground = JBColor.GRAY
-        })
-        add(Box.createVerticalStrut(12))
-        add(JProgressBar().apply {
+    private fun buildLoadingPanel(): JPanel = buildCenteredStatePanel(
+        title = "Loading vulnerabilities",
+        description = "Fetching vulnerability data from Debricked…",
+        footer = JProgressBar().apply {
             isIndeterminate = true
-            maximumSize = Dimension(220, 4)
             alignmentX = Component.CENTER_ALIGNMENT
-        })
-        add(Box.createVerticalGlue())
-    }
+            maximumSize = Dimension(220, preferredSize.height)
+        }
+    )
 
-    private fun buildEmptyPanel(): JPanel = JPanel().apply {
-        layout = BoxLayout(this, BoxLayout.Y_AXIS)
-        add(Box.createVerticalGlue())
-        add(JBLabel("No vulnerabilities found").apply {
-            font = font.deriveFont(Font.BOLD, 13f)
-            alignmentX = Component.CENTER_ALIGNMENT
-        })
-        add(Box.createVerticalStrut(8))
-        add(JBLabel("No open-source vulnerabilities detected for this repository.").apply {
-            alignmentX = Component.CENTER_ALIGNMENT
-            foreground = JBColor.GRAY
-        })
-        add(Box.createVerticalGlue())
-    }
+    private fun buildEmptyPanel(): JPanel = buildCenteredStatePanel(
+        title = "No vulnerabilities found",
+        description = "No open-source vulnerabilities detected for this repository."
+    )
 
     private fun buildFindingsTree(): JBScrollPane {
         val root = DefaultMutableTreeNode("root")
@@ -159,13 +322,46 @@ class DebrickedFindingsPanel(
             isRootVisible = false
             showsRootHandles = true
             cellRenderer = DebrickedTreeCellRenderer()
+            border = JBUI.Borders.empty(8)
             // Expand all severity group rows
             repeat(2) { for (i in 0 until rowCount) expandRow(i) }
         }
-        return JBScrollPane(tree)
+        return JBScrollPane(tree).apply {
+            border = JBUI.Borders.empty()
+            viewportBorder = null
+        }
     }
 
     private fun now(): String = SimpleDateFormat("HH:mm").format(Date())
+
+    private fun buildCenteredStatePanel(
+        title: String,
+        description: String,
+        footer: JComponent? = null
+    ): JPanel = JPanel(GridBagLayout()).apply {
+        border = JBUI.Borders.empty(12)
+        add(JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            border = JBUI.Borders.compound(
+                JBUI.Borders.customLine(JBColor.border()),
+                JBUI.Borders.empty(20, 24)
+            )
+            maximumSize = Dimension(360, Int.MAX_VALUE)
+            add(JBLabel(title).apply {
+                font = font.deriveFont(Font.BOLD, 14f)
+                alignmentX = Component.CENTER_ALIGNMENT
+            })
+            add(Box.createVerticalStrut(8))
+            add(JBLabel(description).apply {
+                alignmentX = Component.CENTER_ALIGNMENT
+                foreground = JBColor.GRAY
+            })
+            if (footer != null) {
+                add(Box.createVerticalStrut(14))
+                add(footer)
+            }
+        })
+    }
 }
 
 /** ColoredTreeCellRenderer for severity group and finding nodes. */
