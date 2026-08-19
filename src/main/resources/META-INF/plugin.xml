@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<idea-plugin>
+    <id>com.debricked.intellijplugin</id>
+    <name>Debricked</name>
+    <vendor email="support@debricked.com" url="https://debricked.com">Debricked</vendor>
+
+    <description><![CDATA[
+        <p>Debricked IntelliJ Plugin integrates Fortify Software Composition Analysis (SCA) findings
+        directly into your IDE, helping you identify and fix open-source vulnerabilities as you code.</p>
+
+        <h3>Features (Phase 1)</h3>
+        <ul>
+            <li>Connect your IntelliJ project to a Debricked repository</li>
+            <li>Automatically detect current Git branch and commit</li>
+            <li>Pull vulnerability findings from Debricked</li>
+            <li>Smart fallback: exact commit → latest branch → default branch</li>
+            <li>View findings in a dedicated tool window</li>
+            <li>Detect local dependency changes and flag staleness</li>
+        </ul>
+
+        <h3>Getting Started</h3>
+        <ol>
+            <li>Open the Debricked tool window (View → Tool Windows → Debricked)</li>
+            <li>Click "Connect to Debricked" and select your repository</li>
+            <li>Findings load automatically for your current commit</li>
+        </ol>
+
+        <p><strong>Authentication:</strong> Generate a long-lived access token in your Debricked account settings.</p>
+    ]]></description>
+
+    <idea-version since-build="232" until-build="243.*"/>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.lang</depends>
+    <depends>Git4Idea</depends>
+
+    <applicationListeners>
+    </applicationListeners>
+
+    <projectListeners>
+    </projectListeners>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <applicationService serviceImplementation="com.debricked.intellijplugin.settings.DebrickedSettingsManager"/>
+        <applicationService serviceImplementation="com.debricked.intellijplugin.api.DebrickedApiClient"/>
+        <projectService serviceImplementation="com.debricked.intellijplugin.core.DebrickedPluginManager"/>
+
+        <toolWindow factoryClass="com.debricked.intellijplugin.ui.DebrickedToolWindowFactory"
+                    id="Debricked"
+                    anchor="right"
+                    icon="/icons/debricked-icon.svg"/>
+
+        <projectConfigurable instance="com.debricked.intellijplugin.settings.DebrickedSettingsConfigurable"
+                           id="com.debricked.settings"
+                           displayName="Debricked"
+                           parentId="tools"/>
+    </extensions>
+
+    <actions>
+        <action id="Debricked.RefreshFindings" class="com.debricked.intellijplugin.actions.RefreshFindingsAction"
+                text="Refresh Findings" description="Refresh Debricked findings"
+                icon="/icons/refresh.svg">
+        </action>
+        <action id="Debricked.RunLocalScan" class="com.debricked.intellijplugin.actions.RunLocalScanAction"
+                text="Run Local Scan" description="Run Debricked CLI scan"
+                icon="/icons/scan.svg">
+        </action>
+    </actions>
+</idea-plugin>

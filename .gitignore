@@ -25,3 +25,20 @@ replay_pid*
 
 # Kotlin Gradle plugin data, see https://kotlinlang.org/docs/whatsnew20.html#new-directory-for-kotlin-data-in-gradle-projects
 .kotlin/
+
+# Gradle wrapper - the jar and jar checksums should be committed
+# but gradle caches and build output should not
+/build/
+.gradle/
+!gradle/wrapper/gradle-wrapper.jar
+gradle/wrapper/.gradle/
+
+# IDE
+.idea/
+*.iml
+out/
+
+# IntelliJ plugin dist
+dist/
+
+token.txt
