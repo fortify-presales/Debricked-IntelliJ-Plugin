@@ -4,7 +4,7 @@
 
 This is an IntelliJ IDEA plugin that integrates **Debricked** (open-source vulnerability scanning) directly into the IDE. Developers can authenticate with Debricked, select a repository, and view vulnerability findings organized by severity in a tool window.
 
-**Status**: Phase 1 complete (authentication + basic findings display). Phase 2 in progress (branch selection + UI refinement).
+**Status**: Phase 1 complete (tabbed architecture + vulnerabilities experience + persistence + resiliency). Phase 2 (local scan orchestration) is planned.
 
 ---
 
@@ -44,142 +44,27 @@ This is an IntelliJ IDEA plugin that integrates **Debricked** (open-source vulne
 
 ---
 
-## Phase 2 Major Change: Findings Table Redesign
+## Current Architecture Snapshot
 
-**Important**: Phase 2 includes a major UI redesign from severity-grouped tree to a flat, sortable table matching the Debricked web UI.
+The active UI architecture is already tabbed and provider-based:
 
-### Key Architectural Changes (Phase 2)
+- Tool window shell: `DebrickedTabbedToolWindowContent` in `src/main/kotlin/com/debricked/intellijplugin/ui/TabbedToolWindow.kt`
+- Tab provider contracts: `src/main/kotlin/com/debricked/intellijplugin/ui/TabProvider.kt`
+  - `VulnerabilitiesTabProvider` is active
+  - `PassiveTabProvider` is used for Dashboard/Dependencies/Licenses placeholders
+- Shared header controls: `src/main/kotlin/com/debricked/intellijplugin/ui/common/ToolWindowContextHeader.kt`
+- Vulnerability table/model/renderers:
+  - `src/main/kotlin/com/debricked/intellijplugin/ui/vulnerability/VulnerabilityTableModel.kt`
+  - `src/main/kotlin/com/debricked/intellijplugin/ui/vulnerability/VulnerabilityRenderers.kt`
+  - `src/main/kotlin/com/debricked/intellijplugin/ui/vulnerability/VulnerabilityFormatting.kt`
 
-**1. Severity is now derived from CVSS, not an API field**
-```kotlin
-enum class Severity {
-    // Computed from CVSS score, not from API
-    CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN
-}
+Current behavior to preserve:
 
-// In VulnerabilityFinding:
-val cvssScore: Double? // Primary; ranges 0.0–10.0
-fun calculatedSeverity(): Severity = when (cvssScore) {
-    in 9.0..10.0 -> Severity.CRITICAL
-    in 7.0..8.9 -> Severity.HIGH
-    in 4.0..6.9 -> Severity.MEDIUM
-    in 0.1..3.9 -> Severity.LOW
-    else -> Severity.UNKNOWN
-}
-```
-
-**2. Findings display is now a JTable, not a tree**
-```kotlin
-// Old (Phase 1): ColoredTreeCellRenderer + severity grouping
-// New (Phase 2): JTable with columns: Name, CVSS, Dependencies, Review Status
-
-val table = JTable(DefaultTableModel())
-val sorter = TableRowSorter(table.model)
-table.rowSorter = sorter
-```
-
-**3. Search/filter is real-time, not modal**
-```kotlin
-val searchField = JTextField()
-val filter = RowFilter.regexFilter(".*${searchField.text}.*", NAME_COLUMN, DEPENDENCY_COLUMN)
-sorter.setRowFilter(filter)
-```
-
-### When Implementing Phase 2 Features
-
-#### Replacing the findings tree with a JTable
-
-1. **Update Models**:
-   - Change `VulnerabilityFinding.severity: Severity` to optional or computed
-   - Add `cvssScore: Double?` field
-   - Add `reviewStatus: ReviewStatus?` enum (UNEXAMINED, IN_REVIEW, ACCEPTED, REJECTED)
-   - Add `dependencyName: String` and `dependencyEcosystem: String` for table display
-
-2. **Create Table Column Definitions**:
-   ```kotlin
-   data class FindingColumn(
-       val name: String,
-       val modelIndex: Int,
-       val preferredWidth: Int = 100,
-       val sortable: Boolean = true
-   )
-   
-   val columns = listOf(
-       FindingColumn("Name", 0, 200),        // CVE-ID
-       FindingColumn("CVSS", 1, 80),         // Score with badge
-       FindingColumn("Dependencies", 2, 150), // Package(s)
-       FindingColumn("Review Status", 3, 120),
-       FindingColumn("Discovered", 4, 100)
-   )
-   ```
-
-3. **Implement CVSS Badge Renderer**:
-   ```kotlin
-   class CvssTableCellRenderer : DefaultTableCellRenderer() {
-       override fun getTableCellRendererComponent(...) {
-           val cvss = value as? Double ?: return super.getTableCellRendererComponent(...)
-           val severity = when (cvss) {
-               in 9.0..10.0 -> "🔴"
-               in 7.0..8.9 -> "🟠"
-               in 4.0..6.9 -> "🟡"
-               else -> "🔵"
-           }
-           text = "$cvss $severity"
-           // Set foreground color based on severity
-           foreground = when (cvss) {
-               in 9.0..10.0 -> JBColor.RED
-               in 7.0..8.9 -> JBColor.ORANGE
-               in 4.0..6.9 -> JBColor.YELLOW
-               else -> JBColor.BLUE
-           }
-           return this
-       }
-   }
-   ```
-
-4. **Add Row Sorting**:
-   ```kotlin
-   val sorter = TableRowSorter(table.model)
-   table.rowSorter = sorter
-   
-   // Allow sorting by clicking column headers (default JTable behavior)
-   // Disable sorting for Dependencies column (not meaningful)
-   sorter.setSortable(DEPENDENCY_COLUMN, false)
-   ```
-
-5. **Add Real-Time Search/Filter**:
-   ```kotlin
-   val searchField = JTextField()
-   searchField.document.addDocumentListener(object : DocumentListener {
-       override fun insertUpdate(e: DocumentEvent) = applyFilter()
-       override fun removeUpdate(e: DocumentEvent) = applyFilter()
-       override fun changedUpdate(e: DocumentEvent) = applyFilter()
-       
-       fun applyFilter() {
-           val text = searchField.text.trim()
-           val filter = if (text.isEmpty()) {
-               null
-           } else {
-               RowFilter.regexFilter("(?i).*${Pattern.quote(text)}.*", NAME_COLUMN, DEPENDENCY_COLUMN)
-           }
-           sorter.setRowFilter(filter)
-       }
-   })
-   ```
-
-6. **Update API Client**:
-   - Extract `cvss` (numeric) from vulnerability response
-   - Extract `reviewStatus` if available in response
-   - Parse `dependencies` array into comma-separated display format
-
-#### Handling Review Status (if available in API)
-
-Review Status may not be immediately available in `/vulnerabilities` endpoint. Options:
-1. Fetch separately via `GET /api/{version}/open/vulnerability/{vulnerabilityId}/review-status` (slower, batched)
-2. Leave blank initially, populate on-demand when user clicks row
-3. Mark as "TBD" until API is extended
-
-Check `debricked-api.json` for current response schema before implementing.
+1. Only the active tab loads data; unimplemented tabs stay passive placeholders.
+2. Vulnerabilities data refresh is deduped during startup/context setup.
+3. Vulnerability table state persists (columns, sort, group, search, rows per page).
+4. Vulnerability details split-pane divider position persists.
+5. Timeout/connect failures keep stale results visible and publish timeout state.
 
 ## When Implementing Features
 
@@ -195,23 +80,23 @@ Check `debricked-api.json` for current response schema before implementing.
 
 ### Adding a new UI panel (e.g., details side-pane)
 
-1. Create class in `src/main/kotlin/.../ui/Panels.kt` extending `JPanel`
+1. Prefer creating UI classes under `src/main/kotlin/.../ui/common` or `src/main/kotlin/.../ui/vulnerability`
 2. Use `GridBagLayout` for alignment or `BorderLayout` for sectioning
 3. Apply theme-aware colors: `JBColor(lightColor, darkColor)`
-4. Register update listener in `DebrickedToolWindowContent.onFindingsUpdated()`
+4. Register updates via the tool window/provider flow (`DebrickedTabbedToolWindowContent` + `TabProvider`)
 5. Test in `./gradlew.bat runIde`
 
-**Example**: See `RepositoryBar` and `DebrickedFindingsPanel` in `Panels.kt`
+**Example**: See the vulnerabilities implementation in `TabbedToolWindow.kt` and extracted classes in `ui/common` + `ui/vulnerability`
 
 ### Adding API pagination or new endpoint
 
 1. Add method to `DebrickedApiClient` (handle JWT auth, error responses)
-2. Use `rowsPerPage=100` if paginating; loop until `size < rowsPerPage`
+2. Follow server-driven query state (search/page/rows/sort/order) and cache by query key
 3. Parse nested JSON responses carefully (Debricked wraps fields in objects)
 4. Cache JWT in `DebrickedApiClient.cachedJwt` to avoid re-auth on every call
 5. Test locally with real credentials via `./gradlew.bat runIde`
 
-**Example**: See `getVulnerabilities()` pagination loop in `DebrickedApiClient.kt`
+**Example**: See `getVulnerabilitiesPage()` and detail endpoints in `DebrickedApiClient.kt`
 
 ### Handling modal dialog blockers
 
@@ -241,7 +126,7 @@ Before submitting changes:
 - [ ] Error messages are user-friendly (not stack traces)
 - [ ] All `invokeLater` calls use `ModalityState.any()`
 
-### Adding Unit Tests (Phase 2)
+### Adding Unit Tests
 
 When adding tests for critical logic:
 
@@ -275,11 +160,14 @@ When adding tests for critical logic:
 | `DebrickedPluginManager.kt` | Orchestrator, listener callbacks, state machine | Adding refresh logic, new listeners |
 | `DebrickedApiClient.kt` | HTTP + JWT auth, Debricked API calls | Adding endpoints, fixing parse errors, extracting CVSS/reviewStatus |
 | `DebrickedSettingsConfigurable.kt` | Settings UI, publishes MessageBus topic | Adding new settings, fixing modal blockers |
-| `DebrickedToolWindowFactory.kt` | Tool window container, three content areas | Changing layout, adding new UI sections |
-| `Panels.kt` | UI components (bar, tree, renderers) | **[Phase 2]** Replace tree with JTable; add column renderers |
+| `TabbedToolWindow.kt` | Tool window orchestration + vulnerabilities panel/details | Tab wiring, load/invalidation flow, view-state behavior |
+| `TabProvider.kt` | Tab provider contracts and implementations | Adding active providers for future tabs |
+| `ui/common/ToolWindowContextHeader.kt` | Shared repository/branch header actions and selectors | Context selector behavior, MRU/search interactions |
+| `ui/vulnerability/VulnerabilityTableModel.kt` | Vulnerability rows/group headers/sort/filter shaping | Table/group behavior changes |
+| `ui/vulnerability/VulnerabilityRenderers.kt` | Table renderers/icons/style | Column rendering and visual signals |
 | `DebrickedCredentialStore.kt` | Credential cache (memory + PasswordSafe) | Fixing auth issues, adding new credential types |
-| `Models.kt` | Domain models | **[Phase 2]** Update VulnerabilityFinding (add cvssScore, reviewStatus, remove severity) |
-| `IMPLEMENTATION_PLAN.md` | Phases, architecture, decisions | Reference for design questions, Phase 2 table spec |
+| `Models.kt` | Domain models and findings states | Extending findings/domain state safely |
+| `IMPLEMENTATION_PLAN.md` | Phases, architecture, decisions | Source of truth for current phase scope |
 
 ---
 
@@ -293,10 +181,9 @@ When adding tests for critical logic:
 - Store JWT in PasswordSafe (do that for access token/password only)
 - Forget to publish `DebrickedSettingsNotifier.TOPIC` when settings change
 - Parse Debricked API responses as flat JSON (they're nested; use `textValue()` helper)
-- **[Phase 2]** Use severity enum from API (derive from CVSS score client-side)
-- **[Phase 2]** Forget to use `TableRowSorter` when adding sorting to JTable
-- **[Phase 2]** Update JTable model directly while filter/sorter is active (causes IndexOutOfBoundsException)
-- **[Phase 2]** Add document listeners without checking `searchField.text.isEmpty()` before applying regex filter
+- Implement Dependencies/Licenses active data loading before their planned phases
+- Break startup refresh dedupe by forcing repeated loads in tab-selection events
+- Replace query-key caching with eager full-list loading
 
 ✅ **Do**:
 - Use `ApplicationManager.executeOnPooledThread { }` for background work
@@ -305,10 +192,10 @@ When adding tests for critical logic:
 - Test all changes with `./gradlew.bat runIde` before committing
 - Include `ModalityState.any()` on all `invokeLater` calls
 - Verify with real Debricked API (test locally first)
-- **[Phase 2]** Compute severity from CVSS range (9-10 = CRITICAL, 7-8.9 = HIGH, etc.)
-- **[Phase 2]** Use `TableRowSorter` for column sorting (standard IntelliJ pattern)
-- **[Phase 2]** Convert model row index to view row index when handling selection: `table.convertRowIndexToModel(selectedRow)`
-- **[Phase 2]** Use regex filter with `Pattern.quote()` to escape special characters in search text
+- Keep non-active tabs as placeholders until their planned implementation phase
+- Preserve query-driven vulnerability refresh + caching behavior
+- Keep timeout/connect handling non-destructive (stale results stay visible)
+- Add focused logic tests for cache/settings/manager behavior when changing refresh logic
 
 ---
 
@@ -321,4 +208,4 @@ When adding tests for critical logic:
 
 ---
 
-**Last Updated**: Phase 1 complete, Phase 2 underway (branch selection + UI polish)
+**Last Updated**: Phase 1 complete, aligned with current tabbed/provider architecture

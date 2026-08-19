@@ -113,6 +113,7 @@ enum class FindingsState {
     CURRENT,
     STALE_DEPENDENCY_CHANGES,
     STALE_COMMIT,
+    TIMEOUT,
     NO_REMOTE_RESULTS
 }
 
@@ -222,6 +223,23 @@ data class VulnerabilityRootFixes(
     val isReady: Boolean = false
 )
 
+data class VulnerabilityTimelineDependency(
+    val name: String,
+    val shortName: String? = null,
+    val link: String? = null
+)
+
+data class VulnerabilityTimelineInterval(
+    val vulnerable: Boolean,
+    val startVersion: String? = null,
+    val endVersion: String? = null
+)
+
+data class VulnerabilityTimeline(
+    val dependencies: List<VulnerabilityTimelineDependency> = emptyList(),
+    val intervals: List<VulnerabilityTimelineInterval> = emptyList()
+)
+
 data class VulnerabilityReachabilityDetails(
     val supported: Boolean = true,
     val reachAnalysisLanguage: String? = null,
@@ -232,6 +250,45 @@ data class VulnerabilityReachabilityDetails(
 data class VulnerabilityCvssDetails(
     val explanation: String? = null
 )
+
+// ── Dependencies ──────────────────────────────────────────────────────────────
+
+data class DependencyItem(
+    val id: String,
+    val name: String,
+    val version: String,
+    val ecosystem: String?,
+    val licenses: List<String>,
+    val vulnerabilityCount: Int,
+    val isIndirect: Boolean,
+    val latestVersion: String? = null,
+    val link: String? = null
+)
+
+data class DependencyQuery(
+    val search: String = "",
+    val page: Int = 1,
+    val rowsPerPage: Int = 25,
+    val sortColumn: String = "name",
+    val order: String = "asc"
+)
+
+data class DependencyPageResult(
+    val dependencies: List<DependencyItem>,
+    val page: Int,
+    val rowsPerPage: Int,
+    val totalCount: Int? = null,
+    val hasNext: Boolean = false
+)
+
+enum class DependenciesState {
+    LOADING,
+    CURRENT,
+    NO_RESULTS,
+    ERROR
+}
+
+// ── VulnerabilityDetailsBundle (unchanged) ────────────────────────────────────
 
 data class VulnerabilityDetailsBundle(
     val summarySources: List<VulnerabilitySummarySource> = emptyList(),
@@ -244,6 +301,7 @@ data class VulnerabilityDetailsBundle(
     val repositoryStatuses: List<VulnerabilityRepositoryStatus> = emptyList(),
     val reviewStatusInfo: VulnerabilityReviewStatusInfo? = null,
     val rootFixes: VulnerabilityRootFixes? = null,
+    val vulnerableTimelines: List<VulnerabilityTimeline> = emptyList(),
     val references: List<VulnerabilityReferenceLink> = emptyList(),
     val reachabilityDetails: VulnerabilityReachabilityDetails? = null
 )

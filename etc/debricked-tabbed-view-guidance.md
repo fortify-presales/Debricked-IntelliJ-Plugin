@@ -6,6 +6,15 @@ This document describes a recommended tabbed layout for the Debricked IntelliJ p
 
 The goal is to provide a clean, IntelliJ-native experience that separates different types of Software Composition Analysis data without overwhelming the user.
 
+## Current Implementation Snapshot (2026-08-19)
+
+This document is guidance for target UX. Current implementation status in this repository:
+
+- Vulnerabilities tab is the active, implemented tab.
+- Dashboard, Dependencies, and Licenses are visible as placeholder tabs.
+- Tabs are registered through IntelliJ `ContentManager` with a shared repository/branch header.
+- Default startup tab is configurable; current default is Dashboard.
+
 ---
 
 # Recommended High-Level Layout
@@ -228,11 +237,13 @@ Open in Debricked button
 The Vulnerabilities tab should:
 
 1. Load findings for the selected repository and branch.
-2. Group findings by severity.
+2. Support grouping (severity or other fields) as a view option.
 3. Allow filtering by severity.
 4. Allow local search across package names, CVEs, CWEs, and advisory titles.
 5. Display details when a finding is selected.
 6. Open a full vulnerability report in an editor tab on double-click.
+
+Current implementation note: findings are shown in a flat table with configurable sort/group options.
 
 ## Recommended Double-Click Behaviour
 
@@ -464,7 +475,20 @@ Findings tree
 Basic vulnerability details pane
 ```
 
-## Phase 2: Dashboard Tab
+## Phase 2: Local Scan
+
+Add local scan orchestration and refresh workflows.
+
+Implement:
+
+```text
+Run local scan action
+Preflight checks (CLI/auth/config)
+Scan progress and completion state
+Refresh vulnerabilities after successful scan
+```
+
+## Phase 3: Dependencies Tab
 
 Add a summary view.
 
@@ -476,21 +500,6 @@ Dependency counts
 License issue counts
 Last scan timestamp
 Navigation buttons to detailed tabs
-```
-
-## Phase 3: Dependencies Tab
-
-Add dependency inventory support.
-
-Implement:
-
-```text
-Dependency list
-Ecosystem filter
-Search
-Dependency details pane
-Known vulnerability count
-Open Dependency action
 ```
 
 ## Phase 4: Licenses Tab
@@ -507,7 +516,21 @@ Package list by license
 View Policy action
 ```
 
-## Phase 5: Rich Detail Tabs
+## Phase 5: Dashboard Tab
+
+Add a summary landing view.
+
+Implement:
+
+```text
+Vulnerability counts
+Dependency counts
+License issue counts
+Last scan timestamp
+Navigation buttons to detailed tabs
+```
+
+## Phase 6: Rich Detail Tabs
 
 Add nested details for more advanced investigation.
 
@@ -674,13 +697,20 @@ Best for early versions of the plugin.
 
 ## Recommendation
 
-For the first production version, default to:
+Use a configurable default tab and tune it to user/team workflow.
+
+Current project default:
+
+```text
+Dashboard
+```
+
+If the workflow is vulnerability-first, switch the default tab to:
 
 ```text
 Vulnerabilities
 ```
 
-Once the Dashboard tab is mature, consider making Dashboard the default landing tab.
 
 ---
 

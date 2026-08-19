@@ -10,8 +10,16 @@ import com.google.gson.JsonObject
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.logger
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URL
 import java.net.URLEncoder
+import java.net.ConnectException
+
+private const val LOGIN_CONNECT_TIMEOUT_MS = 15000
+private const val LOGIN_READ_TIMEOUT_MS = 15000
+private const val API_CONNECT_TIMEOUT_MS = 15000
+private const val API_READ_TIMEOUT_MS = 30000
+private const val RETRY_ATTEMPTS = 3
 
 @Service(Service.Level.APP)
 class DebrickedApiClient {
@@ -81,8 +89,8 @@ class DebrickedApiClient {
         connection.requestMethod = "POST"
         connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
         connection.setRequestProperty("Accept", "application/json")
-        connection.connectTimeout = 15000
-        connection.readTimeout = 15000
+        connection.connectTimeout = LOGIN_CONNECT_TIMEOUT_MS
+        connection.readTimeout = LOGIN_READ_TIMEOUT_MS
         connection.doOutput = true
         val postData = body.toByteArray(Charsets.UTF_8)
         connection.outputStream.use { it.write(postData) }
@@ -104,8 +112,8 @@ class DebrickedApiClient {
         connection.requestMethod = "GET"
         connection.setRequestProperty("Authorization", "Bearer $jwt")
         connection.setRequestProperty("Accept", "application/json")
-        connection.connectTimeout = 15000
-        connection.readTimeout = 15000
+        connection.connectTimeout = API_CONNECT_TIMEOUT_MS
+        connection.readTimeout = API_READ_TIMEOUT_MS
 
         val statusCode = connection.responseCode
         if (statusCode == 200) {
@@ -220,6 +228,13 @@ class DebrickedApiClient {
     }
 
     private fun makeAuthenticatedRequest(method: String, endpoint: String, body: String? = null): String {
+        val retryableRequest = method.equals("GET", ignoreCase = true) && body == null
+        return executeWithTransientRetry("$method $endpoint", retryableRequest) {
+            makeAuthenticatedRequestOnce(method, endpoint, body)
+        }
+    }
+
+    private fun makeAuthenticatedRequestOnce(method: String, endpoint: String, body: String? = null): String {
         ensureValidJwt()
 
         val jwt = cachedJwt
@@ -234,8 +249,8 @@ class DebrickedApiClient {
         connection.setRequestProperty("Authorization", "Bearer $jwt")
         connection.setRequestProperty("Accept", "application/json")
         connection.setRequestProperty("Content-Type", "application/json")
-        connection.connectTimeout = 10000
-        connection.readTimeout = 10000
+        connection.connectTimeout = API_CONNECT_TIMEOUT_MS
+        connection.readTimeout = API_READ_TIMEOUT_MS
         if (body != null) {
             connection.doOutput = true
             connection.outputStream.bufferedWriter(Charsets.UTF_8).use { it.write(body) }
@@ -244,7 +259,7 @@ class DebrickedApiClient {
         return when (connection.responseCode) {
             401 -> {
                 refreshJwt()
-                makeAuthenticatedRequest(method, endpoint, body)
+                makeAuthenticatedRequestOnce(method, endpoint, body)
             }
             200, 201 -> connection.inputStream.bufferedReader().use { it.readText() }
             204 -> ""
@@ -253,6 +268,26 @@ class DebrickedApiClient {
                 connection.responseCode
             )
         }
+    }
+
+    private fun <T> executeWithTransientRetry(requestLabel: String, retryable: Boolean, action: () -> T): T {
+        var last: Exception? = null
+        val maxAttempts = if (retryable) RETRY_ATTEMPTS else 1
+        for (attempt in 1..maxAttempts) {
+            try {
+                return action()
+            } catch (e: Exception) {
+                val transient = e is SocketTimeoutException || e is ConnectException
+                if (!retryable || !transient || attempt == maxAttempts) {
+                    throw e
+                }
+                last = e
+                val backoffMs = 300L * attempt
+                LOG.warn("Transient API failure on $requestLabel (attempt $attempt/$maxAttempts): ${e.message}")
+                Thread.sleep(backoffMs)
+            }
+        }
+        throw last ?: IllegalStateException("Failed request: $requestLabel")
     }
 
     private fun refreshJwt() {
@@ -283,8 +318,8 @@ class DebrickedApiClient {
             val connection = URL("$apiUrl/$loginPath").openConnection() as HttpURLConnection
             connection.requestMethod = "POST"
             connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-            connection.connectTimeout = 15000
-            connection.readTimeout = 15000
+            connection.connectTimeout = LOGIN_CONNECT_TIMEOUT_MS
+            connection.readTimeout = LOGIN_READ_TIMEOUT_MS
 
             val postData = body.toByteArray(Charsets.UTF_8)
             connection.doOutput = true
@@ -1092,6 +1127,15 @@ class DebrickedApiClient {
         )
     }
 
+    fun getVulnerabilityVulnerableTimeline(
+        vulnerabilityId: String,
+        repositoryId: String
+    ): List<VulnerabilityTimeline> {
+        val root = readJsonObject("/vulnerability/$vulnerabilityId/vulnerable-timeline?repositoryId=$repositoryId")
+        val timelines = root.getAsJsonArray("timelines") ?: return emptyList()
+        return timelines.mapNotNull { parseVulnerabilityTimeline(it) }
+    }
+
     fun getVulnerabilityReviewStatus(vulnerabilityId: String, repositoryId: String): VulnerabilityReviewStatusInfo {
         val root = readJsonObject("/vulnerability/$vulnerabilityId/review-status?repositoryId=$repositoryId")
         val repositories = root.getAsJsonArray("repositories")?.mapNotNull { parseRepositoryStatus(it) } ?: emptyList()
@@ -1136,6 +1180,35 @@ class DebrickedApiClient {
                 throw e
             }
         }
+    }
+
+    private fun parseVulnerabilityTimeline(element: JsonElement): VulnerabilityTimeline? {
+        if (!element.isJsonObject) return null
+        val obj = element.asJsonObject
+        val dependencies = obj.getAsJsonArray("dependencies")?.mapNotNull { dependencyElement ->
+            if (!dependencyElement.isJsonObject) return@mapNotNull null
+            val dependency = dependencyElement.asJsonObject
+            val name = textValue(dependency.get("name")) ?: return@mapNotNull null
+            VulnerabilityTimelineDependency(
+                name = name,
+                shortName = textValue(dependency.get("shortName")),
+                link = textValue(dependency.get("link"))
+            )
+        } ?: emptyList()
+        val intervals = obj.getAsJsonArray("intervals")?.mapNotNull { intervalElement ->
+            if (!intervalElement.isJsonObject) return@mapNotNull null
+            val interval = intervalElement.asJsonObject
+            VulnerabilityTimelineInterval(
+                vulnerable = boolValue(interval.get("vulnerable")) ?: false,
+                startVersion = textValue(interval.get("startVersion")),
+                endVersion = textValue(interval.get("endVersion"))
+            )
+        } ?: emptyList()
+        if (dependencies.isEmpty() && intervals.isEmpty()) return null
+        return VulnerabilityTimeline(
+            dependencies = dependencies,
+            intervals = intervals
+        )
     }
 
     private fun parseRepositoryStatus(element: JsonElement): VulnerabilityRepositoryStatus? {
@@ -1211,6 +1284,165 @@ class DebrickedApiClient {
     }
 
     fun getLastRefreshError(): String? = lastRefreshError
+
+    // ── Dependencies ────────────────────────────────────────────────────────────
+
+    fun getDependenciesPage(
+        repositoryId: String,
+        branchId: String? = null,
+        query: com.debricked.intellijplugin.domain.DependencyQuery = com.debricked.intellijplugin.domain.DependencyQuery()
+    ): com.debricked.intellijplugin.domain.DependencyPageResult {
+        val params = buildString {
+            append("repositoryId=$repositoryId")
+            append("&rowsPerPage=${query.rowsPerPage.coerceAtLeast(1)}")
+            append("&page=${query.page.coerceAtLeast(1)}")
+            if (!branchId.isNullOrBlank()) {
+                append("&branchId=${URLEncoder.encode(branchId, "UTF-8")}")
+            }
+            if (query.search.isNotBlank()) {
+                append("&search=${URLEncoder.encode(query.search, "UTF-8")}")
+            }
+            if (query.sortColumn.isNotBlank()) {
+                append("&sortColumn=${URLEncoder.encode(query.sortColumn, "UTF-8")}")
+            }
+            if (query.order.isNotBlank()) {
+                append("&order=${URLEncoder.encode(query.order, "UTF-8")}")
+            }
+        }
+        val response = makeAuthenticatedRequest("GET", "/dependencies/get-hierarchy?$params")
+        return parseDependenciesPageResponse(response, query.page.coerceAtLeast(1), query.rowsPerPage.coerceAtLeast(1))
+    }
+
+    private fun parseDependenciesPageResponse(
+        json: String,
+        requestedPage: Int,
+        requestedRowsPerPage: Int
+    ): com.debricked.intellijplugin.domain.DependencyPageResult {
+        return try {
+            val deps = mutableListOf<com.debricked.intellijplugin.domain.DependencyItem>()
+            val root = gson.fromJson(json, JsonElement::class.java)
+            var totalCount: Int? = null
+
+            when {
+                root.isJsonArray -> root.asJsonArray.forEach { element ->
+                    if (element.isJsonObject) deps.add(parseDependencyItem(element.asJsonObject))
+                }
+                root.isJsonObject -> {
+                    val objectRoot = root.asJsonObject
+                    totalCount = intValue(objectRoot.get("totalRows"))
+                        ?: intValue(objectRoot.get("total"))
+                        ?: intValue(objectRoot.get("totalCount"))
+                        ?: intValue(objectRoot.get("count"))
+                        ?: intValue(objectRoot.get("recordsTotal"))
+                    listOf("rows", "data", "dependencies", "items", "results").forEach { key ->
+                        if (objectRoot.has(key) && objectRoot.get(key).isJsonArray) {
+                            objectRoot.getAsJsonArray(key).forEach { element ->
+                                if (element.isJsonObject) deps.add(parseDependencyItem(element.asJsonObject))
+                            }
+                        }
+                    }
+                }
+            }
+
+            val page = requestedPage.coerceAtLeast(1)
+            val rowsPerPage = requestedRowsPerPage.coerceAtLeast(1)
+            val hasNext = when {
+                totalCount != null -> page * rowsPerPage < totalCount
+                else -> deps.size >= rowsPerPage
+            }
+            com.debricked.intellijplugin.domain.DependencyPageResult(
+                dependencies = deps,
+                page = page,
+                rowsPerPage = rowsPerPage,
+                totalCount = totalCount,
+                hasNext = hasNext
+            )
+        } catch (e: Exception) {
+            LOG.error("Error parsing dependencies: ${e.message}", e)
+            com.debricked.intellijplugin.domain.DependencyPageResult(
+                dependencies = emptyList(),
+                page = requestedPage.coerceAtLeast(1),
+                rowsPerPage = requestedRowsPerPage.coerceAtLeast(1),
+                totalCount = 0,
+                hasNext = false
+            )
+        }
+    }
+
+    private fun parseDependencyItem(obj: JsonObject): com.debricked.intellijplugin.domain.DependencyItem {
+        val id = textValue(obj.get("id")) ?: textValue(obj.get("dependencyId")) ?: ""
+        val name = textValue(obj.get("name")) ?: textValue(obj.get("packageName")) ?: ""
+        val version = textValue(obj.get("version")) ?: textValue(obj.get("currentVersion")) ?: ""
+        val latestVersion = textValue(obj.get("latestVersion")) ?: textValue(obj.get("newestVersion"))
+
+        // Licenses: can be array of strings, array of objects, or a comma-separated string
+        val licenses = mutableListOf<String>()
+        obj.get("licenses")?.let { el ->
+            when {
+                el.isJsonArray -> el.asJsonArray.forEach { item ->
+                    when {
+                        item.isJsonPrimitive -> item.asString.takeIf { it.isNotBlank() }?.let { licenses.add(it) }
+                        item.isJsonObject -> {
+                            val name2 = textValue(item.asJsonObject.get("name"))
+                                ?: textValue(item.asJsonObject.get("spdxId"))
+                                ?: textValue(item.asJsonObject.get("id"))
+                            name2?.takeIf { it.isNotBlank() }?.let { licenses.add(it) }
+                        }
+                        else -> {}
+                    }
+                }
+                el.isJsonPrimitive -> el.asString.split(",").map { it.trim() }.filter { it.isNotBlank() }
+                    .forEach { licenses.add(it) }
+                else -> {}
+            }
+        }
+        if (licenses.isEmpty()) {
+            textValue(obj.get("license"))?.takeIf { it.isNotBlank() }?.let { licenses.add(it) }
+        }
+
+        val vulnCount = intValue(obj.get("totalVulnerabilities"))
+            ?: intValue(obj.get("vulnerabilityCount"))
+            ?: intValue(obj.get("vulnerabilities"))
+            ?: 0
+
+        val isIndirect = boolValue(obj.get("isIndirect"))
+            ?: boolValue(obj.get("indirect"))
+            ?: (textValue(obj.get("dependencyScope"))?.equals("indirect", ignoreCase = true) ?: false)
+            .let { if (it) true else (textValue(obj.get("type"))?.equals("transitive", ignoreCase = true) ?: false) }
+
+        // Ecosystem from name like "spring-boot (Maven)" or a separate field
+        val ecosystemFromField = textValue(obj.get("ecosystem"))
+            ?: textValue(obj.get("packageManager"))
+            ?: textValue(obj.get("sourceParser"))
+        val ecosystem = ecosystemFromField
+            ?: extractEcosystemFromName(name)
+
+        val link = textValue(obj.get("link")) ?: textValue(obj.get("url"))
+
+        return com.debricked.intellijplugin.domain.DependencyItem(
+            id = id,
+            name = stripEcosystemFromName(name),
+            version = version,
+            ecosystem = ecosystem,
+            licenses = licenses,
+            vulnerabilityCount = vulnCount,
+            isIndirect = isIndirect,
+            latestVersion = latestVersion,
+            link = link
+        )
+    }
+
+    private fun extractEcosystemFromName(name: String): String? {
+        val start = name.lastIndexOf('(')
+        val end = name.lastIndexOf(')')
+        if (start < 0 || end <= start) return null
+        return name.substring(start + 1, end).trim().takeIf { it.isNotBlank() }
+    }
+
+    private fun stripEcosystemFromName(name: String): String {
+        val eco = extractEcosystemFromName(name) ?: return name
+        return name.removeSuffix("($eco)").trim()
+    }
 }
 
 data class DebrickedRepository(

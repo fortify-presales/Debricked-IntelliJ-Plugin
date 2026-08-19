@@ -41,5 +41,4 @@ out/
 # IntelliJ plugin dist
 dist/
 
-etc/debricked-api.json
-debricked_access_token.txt
+token.txt

@@ -1,8 +1,14 @@
 package com.debricked.intellijplugin.ui
 
 import com.debricked.intellijplugin.api.DebrickedApiClient
+import com.debricked.intellijplugin.core.DataCache
+import com.debricked.intellijplugin.core.DependencyCache
 import com.debricked.intellijplugin.core.DebrickedPluginManager
 import com.debricked.intellijplugin.domain.DebrickedScanContext
+import com.debricked.intellijplugin.domain.DependenciesState
+import com.debricked.intellijplugin.domain.DependencyItem
+import com.debricked.intellijplugin.domain.DependencyPageResult
+import com.debricked.intellijplugin.domain.DependencyQuery
 import com.debricked.intellijplugin.domain.FindingsState
 import com.debricked.intellijplugin.domain.Severity
 import com.debricked.intellijplugin.domain.VulnerabilityDetailsBundle
@@ -18,10 +24,28 @@ import com.debricked.intellijplugin.domain.VulnerabilityReviewStatusInfo
 import com.debricked.intellijplugin.domain.VulnerabilityRootFixes
 import com.debricked.intellijplugin.domain.VulnerabilityScoreSummary
 import com.debricked.intellijplugin.domain.VulnerabilitySummarySource
+import com.debricked.intellijplugin.domain.VulnerabilityTimeline
 import com.debricked.intellijplugin.settings.DebrickedCredentialStore
 import com.debricked.intellijplugin.settings.DebrickedDefaultTab
 import com.debricked.intellijplugin.settings.DebrickedSettingsConfigurable
 import com.debricked.intellijplugin.settings.DebrickedSettingsManager
+import com.debricked.intellijplugin.ui.common.PlaceholderTabPanel
+import com.debricked.intellijplugin.ui.common.ToolWindowContextHeader
+import com.debricked.intellijplugin.ui.common.ToolWindowContextHeaderController
+import com.debricked.intellijplugin.ui.dependency.DependencyTableModel
+import com.debricked.intellijplugin.ui.dependency.DependencyColumns
+import com.debricked.intellijplugin.ui.vulnerability.cvssDetailsDisplay
+import com.debricked.intellijplugin.ui.vulnerability.CvssRenderer
+import com.debricked.intellijplugin.ui.vulnerability.discoveredRelativeDisplay
+import com.debricked.intellijplugin.ui.vulnerability.displaySeverity
+import com.debricked.intellijplugin.ui.vulnerability.exploitedDisplay
+import com.debricked.intellijplugin.ui.vulnerability.fallbackDependencies
+import com.debricked.intellijplugin.ui.vulnerability.introducedDateText
+import com.debricked.intellijplugin.ui.vulnerability.LeftAlignRenderer
+import com.debricked.intellijplugin.ui.vulnerability.NameRenderer
+import com.debricked.intellijplugin.ui.vulnerability.primaryIdentifier
+import com.debricked.intellijplugin.ui.vulnerability.reviewStatusDisplay
+import com.debricked.intellijplugin.ui.vulnerability.VulnerabilityTableModel
 import com.intellij.ide.BrowserUtil
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.actionSystem.AnAction
@@ -38,9 +62,12 @@ import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.actionSystem.ex.ComboBoxAction
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
+import com.intellij.openapi.fileEditor.FileEditorManager
+import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.options.ShowSettingsUtil
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.ui.JBColor
 import com.intellij.ui.SearchTextField
@@ -58,6 +85,7 @@ import java.awt.Component
 import java.awt.Cursor
 import java.awt.Dimension
 import java.awt.Font
+import java.awt.FlowLayout
 import java.awt.Graphics
 import java.awt.Graphics2D
 import java.awt.GridBagConstraints
@@ -74,7 +102,14 @@ import java.time.format.DateTimeFormatter
 import java.awt.geom.Path2D
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import java.awt.event.ComponentAdapter
+import java.awt.event.ComponentEvent
+import java.net.URI
 import java.net.URLEncoder
+import java.io.File
+import java.nio.file.Files
+import java.nio.file.Path
+import java.util.concurrent.TimeUnit
 import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.JButton
@@ -109,7 +144,7 @@ private enum class DebrickedTab {
 class DebrickedTabbedToolWindowContent(
     private val project: Project,
     private val toolWindow: ToolWindow
-) : DebrickedPluginManager.FindingsUpdateListener {
+) : DebrickedPluginManager.FindingsUpdateListener, ToolWindowContextHeaderController {
 
     private val pluginManager = project.getService(DebrickedPluginManager::class.java)
     private val apiClient = ApplicationManager.getApplication().getService(DebrickedApiClient::class.java)
@@ -122,15 +157,15 @@ class DebrickedTabbedToolWindowContent(
     )
     private val dashboardPanel = PlaceholderTabPanel(
         "Dashboard",
-        "Summary widgets and quick actions will be added in Phase 2."
+        "Summary widgets and quick actions will be added soon."
     )
     private val dependenciesPanel = PlaceholderTabPanel(
         "Dependencies",
-        "Direct and transitive dependency views will be added in Phase 3."
+        "Dependency inventory and details will be added soon."
     )
     private val licensesPanel = PlaceholderTabPanel(
         "Licenses",
-        "License summary and policy information will be added in Phase 4."
+        "License summary and policy information will be added soon."
     )
 
     private val vulnerabilitiesTabProvider = VulnerabilitiesTabProvider(vulnerabilitiesPanel, pluginManager)
@@ -148,6 +183,7 @@ class DebrickedTabbedToolWindowContent(
     private var loadingBranches = false
     private var startupContextReady = false
     private var vulnerabilitiesDirty = true
+    private var vulnerabilitiesForceRefreshPending = false
 
     init {
         DebrickedCredentialStore.loadFromStorage()
@@ -170,7 +206,7 @@ class DebrickedTabbedToolWindowContent(
     }
 
     private fun installContents() {
-        val contentFactory = ContentFactory.SERVICE.getInstance()
+        val contentFactory = ContentFactory.getInstance()
         toolWindow.contentManager.removeAllContents(true)
 
         addTabContent(contentFactory, DebrickedTab.DASHBOARD, "Dashboard", dashboardPanel)
@@ -286,6 +322,7 @@ class DebrickedTabbedToolWindowContent(
         settings.setRepositoryId(repository.id)
         settings.setRepositoryName(repository.name)
         settings.setDefaultBranch(repository.defaultBranch)
+        settings.pushRecentRepositoryId(repository.id)
 
         if (repositoryChanged) {
             settings.setSelectedBranchId("")
@@ -383,14 +420,24 @@ class DebrickedTabbedToolWindowContent(
     }
 
     private fun onToolWindowTabSelected() {
-        if (selectedTab() != DebrickedTab.VULNERABILITIES || !startupContextReady) return
+        val selected = selectedTab()
+        if (!startupContextReady) return
         val context = currentTabContext()
-        vulnerabilitiesTabProvider.loadData(context, vulnerabilitiesDirty)
-        vulnerabilitiesDirty = false
+        when (selected) {
+            DebrickedTab.VULNERABILITIES -> {
+                if (vulnerabilitiesDirty) {
+                    vulnerabilitiesTabProvider.loadData(context, vulnerabilitiesForceRefreshPending)
+                    vulnerabilitiesDirty = false
+                    vulnerabilitiesForceRefreshPending = false
+                }
+            }
+            else -> {}
+        }
     }
 
     private fun requestVulnerabilityLoad(forceRefresh: Boolean) {
-        vulnerabilitiesDirty = vulnerabilitiesDirty || forceRefresh
+        vulnerabilitiesDirty = true
+        vulnerabilitiesForceRefreshPending = vulnerabilitiesForceRefreshPending || forceRefresh
         if (selectedTab() == DebrickedTab.VULNERABILITIES && startupContextReady) {
             onToolWindowTabSelected()
         }
@@ -408,30 +455,30 @@ class DebrickedTabbedToolWindowContent(
         DebrickedDefaultTab.LICENSES -> DebrickedTab.LICENSES
     }
 
-    fun repositoryActionText(): String =
+    override fun repositoryActionText(): String =
         repositories.firstOrNull { it.id == settings.getRepositoryId() }?.name
             ?: settings.getRepositoryName().ifBlank { "Repository" }
 
-    fun branchActionText(): String =
+    override fun branchActionText(): String =
         branches.firstOrNull { it.id == settings.getSelectedBranchId() }?.name
             ?: settings.getSelectedBranchName().ifBlank { "Branch" }
 
-    internal fun hasCredentials(): Boolean = pluginManager.hasCredentials()
-    internal fun hasRepositories(): Boolean = repositories.isNotEmpty()
-    internal fun hasBranches(): Boolean = branches.isNotEmpty()
-    internal fun isLoadingBranches(): Boolean = loadingBranches
-    internal fun availableRepositories(): List<RepositoryChoice> = repositories
-    internal fun availableBranches(): List<BranchChoice> = branches
+    override fun hasCredentials(): Boolean = pluginManager.hasCredentials()
+    override fun hasRepositories(): Boolean = repositories.isNotEmpty()
+    override fun hasBranches(): Boolean = branches.isNotEmpty()
+    override fun isLoadingBranches(): Boolean = loadingBranches
+    override fun availableRepositories(): List<RepositoryChoice> = repositories
+    override fun availableBranches(): List<BranchChoice> = branches
 
-    internal fun selectRepository(repository: RepositoryChoice) {
+    override fun selectRepository(repository: RepositoryChoice) {
         handleRepositorySelected(repository, forceSelectionRefresh = true)
     }
 
-    internal fun selectBranch(branch: BranchChoice) {
+    override fun selectBranch(branch: BranchChoice) {
         applyBranchSelection(branch, forceSelectionRefresh = true)
     }
 
-    internal fun refreshRepositoriesFromToolbar() {
+    override fun refreshRepositoriesFromToolbar() {
         loadRepositories(forceSelectionRefresh = true)
     }
 
@@ -458,172 +505,8 @@ class DebrickedTabbedToolWindowContent(
         }
     }
 
-    internal fun openSettingsFromToolbar() {
+    override fun openSettingsFromToolbar() {
         openSettings()
-    }
-}
-
-private class ToolWindowContextHeader(
-    private val controller: DebrickedTabbedToolWindowContent
-) : JPanel(GridBagLayout()) {
-    private val repositoryAction = RepositorySelectionAction(controller)
-    private val branchAction = BranchSelectionAction(controller)
-    private val contextToolbar = ActionManager.getInstance()
-        .createActionToolbar("DebrickedContextHeader", DefaultActionGroup(repositoryAction, branchAction), true)
-    private val refreshRepositoriesButton = JButton("Refresh repositories", AllIcons.Actions.Refresh).apply {
-        toolTipText = "Reload repository list from Debricked"
-        addActionListener { controller.refreshRepositoriesFromToolbar() }
-    }
-    private val settingsButton = JButton("Settings", AllIcons.General.Settings).apply {
-        toolTipText = "Open Debricked settings"
-        addActionListener { controller.openSettingsFromToolbar() }
-    }
-
-    init {
-        isOpaque = false
-        border = JBUI.Borders.compound(
-            JBUI.Borders.customLine(JBColor.border(), 0, 0, 1, 0),
-            JBUI.Borders.empty(6, 8)
-        )
-
-        contextToolbar.setTargetComponent(this)
-        contextToolbar.setMinimumButtonSize(ActionToolbar.DEFAULT_MINIMUM_BUTTON_SIZE)
-        contextToolbar.component.isOpaque = false
-        add(contextToolbar.component, GridBagConstraints().apply {
-            gridx = 0
-            gridy = 0
-            insets = Insets(0, 0, 0, 8)
-        })
-        add(JPanel().apply { isOpaque = false }, GridBagConstraints().apply {
-            gridx = 1
-            gridy = 0
-            insets = Insets(0, 0, 0, 8)
-        })
-        add(refreshRepositoriesButton, GridBagConstraints().apply {
-            gridx = 2
-            gridy = 0
-            insets = Insets(0, 0, 0, 8)
-        })
-        add(JPanel().apply { isOpaque = false }, GridBagConstraints().apply {
-            gridx = 3
-            gridy = 0
-            weightx = 1.0
-            fill = GridBagConstraints.HORIZONTAL
-        })
-        add(settingsButton, GridBagConstraints().apply {
-            gridx = 4
-            gridy = 0
-        })
-
-        syncFromController()
-    }
-
-    fun syncFromController() {
-        contextToolbar.updateActionsImmediately()
-
-        settingsButton.isEnabled = true
-    }
-}
-
-private class RepositorySelectionAction(
-    private val controller: DebrickedTabbedToolWindowContent
-) : ComboBoxAction() {
-    init {
-        setPopupTitle("Select Repository")
-        setSmallVariant(true)
-    }
-
-    override fun update(e: AnActionEvent) {
-        e.presentation.text = controller.repositoryActionText()
-        e.presentation.description = "Select Debricked repository"
-        e.presentation.isEnabled = controller.hasCredentials() && controller.hasRepositories()
-    }
-
-    override fun createPopupActionGroup(button: JComponent, dataContext: DataContext): DefaultActionGroup {
-        val group = DefaultActionGroup()
-        val repositories = controller.availableRepositories()
-        val selectedRepositoryId = DebrickedSettingsManager.getInstance().getRepositoryId()
-        val shortlist = mutableListOf<RepositoryChoice>()
-
-        repositories.firstOrNull { it.id == selectedRepositoryId }?.let { shortlist.add(it) }
-        repositories.asSequence()
-            .filter { it.id != selectedRepositoryId }
-            .take(REPOSITORY_SHORTLIST_LIMIT - shortlist.size)
-            .forEach { shortlist.add(it) }
-
-        shortlist.forEach { repository ->
-            group.add(object : AnAction(repository.name.ifBlank { repository.id }) {
-                override fun actionPerformed(e: AnActionEvent) {
-                    controller.selectRepository(repository)
-                }
-            })
-        }
-
-        if (repositories.size > shortlist.size) {
-            group.add(object : AnAction("Search all repositories...") {
-                override fun actionPerformed(e: AnActionEvent) {
-                    showRepositorySearchPopup(button, repositories)
-                }
-            })
-        }
-
-        if (group.childActionsOrStubs.isEmpty()) {
-            group.add(disabledAction("No repositories"))
-        }
-        return group
-    }
-    override fun getMinWidth(): Int = 180
-
-    private fun showRepositorySearchPopup(button: JComponent, repositories: List<RepositoryChoice>) {
-        JBPopupFactory.getInstance()
-            .createPopupChooserBuilder(repositories.sortedBy { it.name.ifBlank { it.id }.lowercase() })
-            .setTitle("Select Repository")
-            .setMovable(false)
-            .setResizable(true)
-            .setRequestFocus(true)
-            .setFilterAlwaysVisible(true)
-            .setNamerForFiltering { it.name.ifBlank { it.id } }
-            .setItemChosenCallback { selected -> controller.selectRepository(selected) }
-            .createPopup()
-            .showUnderneathOf(button)
-    }
-}
-
-private class BranchSelectionAction(
-    private val controller: DebrickedTabbedToolWindowContent
-) : ComboBoxAction() {
-    init {
-        setPopupTitle("Select Branch")
-        setSmallVariant(true)
-    }
-
-    override fun update(e: AnActionEvent) {
-        e.presentation.text = if (controller.isLoadingBranches()) "Loading branches..." else controller.branchActionText()
-        e.presentation.description = "Select Debricked branch"
-        e.presentation.isEnabled = controller.hasCredentials() && (controller.hasBranches() || controller.isLoadingBranches())
-    }
-
-    override fun createPopupActionGroup(button: JComponent, dataContext: DataContext): DefaultActionGroup {
-        val group = DefaultActionGroup()
-        controller.availableBranches().forEach { branch ->
-            group.add(object : AnAction(branch.name.ifBlank { branch.id }) {
-                override fun actionPerformed(e: AnActionEvent) {
-                    controller.selectBranch(branch)
-                }
-            })
-        }
-        if (group.childActionsOrStubs.isEmpty()) {
-            group.add(disabledAction("No branches"))
-        }
-        return group
-    }
-    override fun getMinWidth(): Int = 140
-}
-
-private fun disabledAction(text: String): AnAction = object : AnAction(text) {
-    override fun actionPerformed(e: AnActionEvent) {}
-    override fun update(e: AnActionEvent) {
-        e.presentation.isEnabled = false
     }
 }
 
@@ -676,13 +559,14 @@ private class VulnerabilitiesTabPanel(
     }
 
     private val apiClient = ApplicationManager.getApplication().getService(DebrickedApiClient::class.java)
+    private val settings = DebrickedSettingsManager.getInstance()
     private val model = VulnerabilityTableModel()
     private val table = JBTable(model).apply {
         setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
         fillsViewportHeight = true
         rowHeight = 24
     }
-    private val detailsPanel = VulnerabilityDetailsPanel { selectedStatus, reviewInfo ->
+    private val detailsPanel = VulnerabilityDetailsPanel(project) { selectedStatus, reviewInfo ->
         applyReviewStatusChange(selectedStatus, reviewInfo)
     }
     private val statusLabel = JBLabel("Loading...").apply { foreground = JBColor.GRAY }
@@ -744,8 +628,13 @@ private class VulnerabilitiesTabPanel(
     private var currentDetailsContext: VulnerabilityDetailsContext? = null
     private var detailsRequestToken = 0
 
+    private val allowedRowsPerPage = setOf(15, 25, 50, 100)
+    private var persistedDividerLocation = -1
+    private var splitPane: JSplitPane? = null
+
     init {
         border = JBUI.Borders.empty(8)
+        restoreViewState()
         table.selectionModel.addListSelectionListener {
             if (!it.valueIsAdjusting) {
                 updateDetailsForSelection()
@@ -774,6 +663,7 @@ private class VulnerabilitiesTabPanel(
             val selected = pageSizeCombo.selectedItem as? Int ?: return@addActionListener
             if (selected == rowsPerPage) return@addActionListener
             rowsPerPage = selected
+            persistViewState()
             currentPage = 1
             dispatchQuery(forceRefresh = false)
         }
@@ -833,10 +723,14 @@ private class VulnerabilitiesTabPanel(
             horizontalScrollBarPolicy = JBScrollPane.HORIZONTAL_SCROLLBAR_NEVER
             border = JBUI.Borders.empty()
         }
-        val splitPane = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, tablePane, detailsScrollPane).apply {
+        splitPane = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, tablePane, detailsScrollPane).apply {
             resizeWeight = 0.5
-            setDividerLocation(0.5)
             border = JBUI.Borders.emptyTop(8)
+        }
+        splitPane?.addPropertyChangeListener(JSplitPane.DIVIDER_LOCATION_PROPERTY) {
+            if ((splitPane?.width ?: 0) > 0) {
+                persistViewState()
+            }
         }
 
         sidebarToolbar.setTargetComponent(this)
@@ -853,10 +747,57 @@ private class VulnerabilitiesTabPanel(
         add(JPanel(BorderLayout()).apply {
             isOpaque = false
             add(sidebarPanel, BorderLayout.WEST)
-            add(splitPane, BorderLayout.CENTER)
+            splitPane?.let { add(it, BorderLayout.CENTER) }
         }, BorderLayout.CENTER)
+        SwingUtilities.invokeLater {
+            splitPane?.let {
+                if (persistedDividerLocation > 0) {
+                    it.dividerLocation = persistedDividerLocation
+                } else {
+                    it.setDividerLocation(0.5)
+                }
+            }
+        }
         showEmptyState("Loading vulnerabilities")
         applySortMode()
+    }
+
+    private fun restoreViewState() {
+        val savedColumns = settings.getVulnerabilitiesVisibleColumns()
+            .split(',')
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .mapNotNull { token -> DisplayColumn.values().firstOrNull { it.name == token } }
+        if (savedColumns.isNotEmpty()) {
+            visibleColumns.clear()
+            visibleColumns.addAll(savedColumns)
+        }
+
+        sortMode = SortMode.values().firstOrNull { it.name == settings.getVulnerabilitiesSortMode() } ?: SortMode.CVSS
+        groupMode = GroupMode.values().firstOrNull { it.name == settings.getVulnerabilitiesGroupMode() } ?: GroupMode.NONE
+
+        rowsPerPage = settings.getVulnerabilitiesRowsPerPage().takeIf { it in allowedRowsPerPage } ?: 25
+        pageSizeCombo.selectedItem = rowsPerPage
+        searchField.text = settings.getVulnerabilitiesSearchText()
+        persistedDividerLocation = settings.getVulnerabilitiesDividerLocation()
+    }
+
+    private fun persistViewState() {
+        settings.setVulnerabilitiesVisibleColumns(visibleColumns.joinToString(",") { it.name })
+        settings.setVulnerabilitiesSortMode(sortMode.name)
+        settings.setVulnerabilitiesGroupMode(groupMode.name)
+        settings.setVulnerabilitiesRowsPerPage(rowsPerPage)
+        settings.setVulnerabilitiesSearchText(searchField.text.trim())
+        splitPane?.let {
+            if (it.dividerLocation > 0) {
+                settings.setVulnerabilitiesDividerLocation(it.dividerLocation)
+            }
+        }
+    }
+
+    override fun removeNotify() {
+        persistViewState()
+        super.removeNotify()
     }
 
     fun updateFindings(
@@ -874,6 +815,7 @@ private class VulnerabilitiesTabPanel(
         refreshView()
         statusLabel.text = when (state) {
             FindingsState.LOADING -> "Loading..."
+            FindingsState.TIMEOUT -> "Connection timed out. Showing last available results"
             FindingsState.NO_REMOTE_RESULTS -> "No findings available"
             FindingsState.STALE_DEPENDENCY_CHANGES -> "Local dependency changes detected"
             FindingsState.STALE_COMMIT -> "Latest branch results"
@@ -881,7 +823,7 @@ private class VulnerabilitiesTabPanel(
         }
         statusLabel.isVisible = statusLabel.text.isNotBlank()
         if (findings.isEmpty()) {
-            detailsPanel.setFinding(null, context)
+            detailsPanel.setFinding(null)
             showEmptyState(statusLabel.text)
         } else {
             showTableState()
@@ -909,6 +851,7 @@ private class VulnerabilitiesTabPanel(
 
     private fun onSearchChanged() {
         searchDebounceTimer.restart()
+        persistViewState()
         applyFilter()
     }
 
@@ -929,9 +872,11 @@ private class VulnerabilitiesTabPanel(
         val pageStart = if (visibleCount == 0) 0 else ((currentPage - 1) * rowsPerPage) + 1
         val pageEnd = (pageStart + visibleCount - 1).coerceAtLeast(0)
         countLabel.text = if (knownTotal != null && knownTotal >= 0) {
-            "Showing $pageStart-$pageEnd of $knownTotal"
+            "$pageStart–$pageEnd of $knownTotal"
+        } else if (visibleCount > 0) {
+            "$visibleCount entries"
         } else {
-            "Showing $visibleCount entries"
+            ""
         }
         previousPageButton.isEnabled = currentPage > 1
         nextPageButton.isEnabled = hasNextPage
@@ -990,12 +935,14 @@ private class VulnerabilitiesTabPanel(
     private fun setSortMode(mode: SortMode) {
         sortMode = mode
         currentPage = 1
+        persistViewState()
         applySortMode()
         dispatchQuery(forceRefresh = false)
     }
 
     private fun setGroupMode(mode: GroupMode) {
         groupMode = mode
+        persistViewState()
         applySortMode()
     }
 
@@ -1005,17 +952,17 @@ private class VulnerabilitiesTabPanel(
         if (viewRow < 0 || viewRow >= table.rowCount) {
             currentDetailsContext = null
             detailsRequestToken += 1
-            detailsPanel.setFinding(null, resolvedContext)
+            detailsPanel.setFinding(null)
             return
         }
         val finding = model.getFindingAt(viewRow)
         if (finding == null) {
             currentDetailsContext = null
             detailsRequestToken += 1
-            detailsPanel.setFinding(null, resolvedContext)
+            detailsPanel.setFinding(null)
             return
         }
-        detailsPanel.setFinding(finding, resolvedContext)
+        detailsPanel.setFinding(finding)
         val detailsContext = buildDetailsContext(finding, resolvedContext)
         currentDetailsContext = detailsContext
         if (detailsContext != null) {
@@ -1088,19 +1035,36 @@ private class VulnerabilitiesTabPanel(
         val affectedDependencies = safeDetailsCall(emptyList()) {
             apiClient.getVulnerabilityAffectedDependencies(context.vulnerabilityId, context.repositoryId, context.commitId)
         }
+        val files = safeDetailsCall(emptyList<VulnerabilityFileRef>()) {
+            apiClient.getVulnerabilityFiles(context.vulnerabilityId, context.repositoryId, context.commitId)
+        }
+        val rootFixes = safeDetailsCall<VulnerabilityRootFixes?>(null) {
+            apiClient.getVulnerabilityRootFixes(context.vulnerabilityId, context.repositoryId, context.commitId)
+        }
+        val vulnerableTimelines = safeDetailsCall(emptyList<VulnerabilityTimeline>()) {
+            apiClient.getVulnerabilityVulnerableTimeline(context.vulnerabilityId, context.repositoryId)
+        }
+        val references = safeDetailsCall(emptyList<VulnerabilityReferenceLink>()) {
+            apiClient.getVulnerabilityReferences(context.vulnerabilityId)
+        }
+        val reachabilityDetails = safeDetailsCall<com.debricked.intellijplugin.domain.VulnerabilityReachabilityDetails?>(null) {
+            context.commitId?.takeIf { it.isNotBlank() }
+                ?.let { apiClient.getVulnerabilityReachabilityData(context.vulnerabilityId, it) }
+        }
         return VulnerabilityDetailsBundle(
             summarySources = summarySources,
             scoreSummaries = scoreSummaries,
             cvssDetails = null,
             dates = com.debricked.intellijplugin.domain.VulnerabilityDates(),
             affectedDependencies = affectedDependencies,
-            files = emptyList(),
+            files = files,
             dependencyTree = null,
             repositoryStatuses = repositoryStatuses,
             reviewStatusInfo = reviewStatusInfo,
-            rootFixes = null,
-            references = emptyList(),
-            reachabilityDetails = null
+            rootFixes = rootFixes,
+            vulnerableTimelines = vulnerableTimelines,
+            references = references,
+            reachabilityDetails = reachabilityDetails
         )
     }
 
@@ -1254,298 +1218,61 @@ private class VulnerabilitiesTabPanel(
             } else {
                 visibleColumns.remove(column)
             }
+            persistViewState()
             applyColumnVisibility()
             refreshView()
         }
     }
 }
 
-private class VulnerabilityTableModel : AbstractTableModel() {
-    private val columns = arrayOf(
-        "Name",
-        "Introduced",
-        "CVSS",
-        "Dependencies",
-        "Reachable Path",
-        "Review Status",
-        "Exploited (CISA)"
-    )
-    private var findings = emptyList<VulnerabilityFinding>()
-    private var rows = emptyList<TableRow>()
-    private var visibleFindings = 0
-
-    private sealed class TableRow {
-        data class GroupHeader(val label: String, val count: Int) : TableRow()
-        data class Finding(val finding: VulnerabilityFinding) : TableRow()
-    }
-
-    fun setFindings(newFindings: List<VulnerabilityFinding>) {
-        findings = newFindings
-    }
-
-    fun rebuildView(
-        textFilter: String,
-        visibleSeverities: Set<Severity>,
-        sortColumn: Int,
-        sortAscending: Boolean,
-        groupColumn: Int?
-    ) {
-        val text = textFilter.lowercase()
-        val filtered = findings.filter { finding ->
-            if (!visibleSeverities.contains(finding.displaySeverity())) return@filter false
-            if (text.isBlank()) return@filter true
-            val name = (finding.cveId ?: finding.id).lowercase()
-            val dep = buildDependencySearchText(finding).lowercase()
-            name.contains(text) || dep.contains(text)
-        }
-
-        val sorted = filtered.sortedWith(compareByColumn(sortColumn, sortAscending))
-        rows = if (groupColumn == null) {
-            sorted.map { TableRow.Finding(it) }
-        } else {
-            buildGroupedRows(sorted, groupColumn)
-        }
-        visibleFindings = filtered.size
-        fireTableDataChanged()
-    }
-
-    fun visibleFindingCount(): Int = visibleFindings
-    fun isGroupHeader(row: Int): Boolean = rows.getOrNull(row) is TableRow.GroupHeader
-    fun getFindingAt(row: Int): VulnerabilityFinding? = (rows.getOrNull(row) as? TableRow.Finding)?.finding
-
-    override fun getRowCount(): Int = rows.size
-    override fun getColumnCount(): Int = columns.size
-    override fun getColumnName(column: Int): String = columns[column]
-
-    override fun getColumnClass(columnIndex: Int): Class<*> = when (columnIndex) {
-        2 -> Double::class.javaObjectType
-        else -> String::class.java
-    }
-
-    override fun getValueAt(rowIndex: Int, columnIndex: Int): Any? {
-        return when (val row = rows[rowIndex]) {
-            is TableRow.GroupHeader -> when (columnIndex) {
-                0 -> "${row.label} (${row.count})"
-                else -> ""
-            }
-            is TableRow.Finding -> {
-                val finding = row.finding
-                when (columnIndex) {
-                    0 -> finding.cveId ?: finding.id
-                    1 -> finding.introducedDateText()
-                    2 -> finding.cvss3Score ?: finding.cvss2Score ?: finding.exploitabilityScore
-                    3 -> buildDependencyText(finding)
-                    4 -> finding.reachablePath ?: "Unknown"
-                    5 -> finding.reviewStatusDisplay()
-                    6 -> finding.exploitedDisplay()
-                    else -> ""
-                }
-            }
-        }
-    }
-
-    private fun buildGroupedRows(sorted: List<VulnerabilityFinding>, groupColumn: Int): List<TableRow> {
-        val grouped = linkedMapOf<String, MutableList<VulnerabilityFinding>>()
-        sorted.forEach { finding ->
-            val key = groupKeyFor(groupColumn, finding)
-            grouped.getOrPut(key) { mutableListOf() }.add(finding)
-        }
-        val output = mutableListOf<TableRow>()
-        grouped.forEach { (key, groupFindings) ->
-            output.add(TableRow.GroupHeader(key, groupFindings.size))
-            groupFindings.forEach { output.add(TableRow.Finding(it)) }
-        }
-        return output
-    }
-
-    private fun compareByColumn(column: Int, ascending: Boolean): Comparator<VulnerabilityFinding> {
-        val factor = if (ascending) 1 else -1
-        return Comparator { a, b ->
-            val cmp = when (column) {
-                0 -> (a.cveId ?: a.id).compareTo((b.cveId ?: b.id), ignoreCase = true)
-                1 -> compareNullableLongs(a.introducedAt, b.introducedAt)
-                2 -> compareCvss(a, b, ascending)
-                3 -> buildPrimaryDependencyText(a).compareTo(buildPrimaryDependencyText(b), ignoreCase = true)
-                4 -> (a.reachablePath ?: "Unknown").compareTo(b.reachablePath ?: "Unknown", ignoreCase = true)
-                5 -> a.reviewStatusDisplay().compareTo(b.reviewStatusDisplay(), ignoreCase = true)
-                6 -> a.exploitedDisplay().compareTo(b.exploitedDisplay(), ignoreCase = true)
-                else -> 0
-            }
-            if (cmp != 0) {
-                if (column == 2) cmp else cmp * factor
-            } else {
-                a.id.compareTo(b.id, ignoreCase = true)
-            }
-        }
-    }
-
-    private fun compareCvss(a: VulnerabilityFinding, b: VulnerabilityFinding, ascending: Boolean): Int {
-        val scoreCmp = compareNullableDoubles(
-            a.cvss3Score ?: a.cvss2Score ?: a.exploitabilityScore,
-            b.cvss3Score ?: b.cvss2Score ?: b.exploitabilityScore
-        )
-        if (scoreCmp != 0) {
-            return if (ascending) scoreCmp else -scoreCmp
-        }
-        return cvssSortRank(a).compareTo(cvssSortRank(b))
-    }
-
-    private fun cvssSortRank(finding: VulnerabilityFinding): Int = when {
-        finding.cvss3Score != null -> 0
-        finding.cvss2Score != null -> 1
-        finding.exploitabilityScore != null -> 2
-        else -> 3
-    }
-
-    private fun compareNullableDoubles(a: Double?, b: Double?): Int = when {
-        a == null && b == null -> 0
-        a == null -> -1
-        b == null -> 1
-        else -> a.compareTo(b)
-    }
-
-    private fun compareNullableLongs(a: Long?, b: Long?): Int = when {
-        a == null && b == null -> 0
-        a == null -> -1
-        b == null -> 1
-        else -> a.compareTo(b)
-    }
-
-    private fun groupKeyFor(column: Int, finding: VulnerabilityFinding): String = when (column) {
-        3 -> buildPrimaryDependencyText(finding)
-        4 -> "Reachable path: ${finding.reachablePath ?: "Unknown"}"
-        5 -> "Review status: ${finding.reviewStatusDisplay()}"
-        6 -> "Exploited (CISA): ${finding.exploitedDisplay()}"
-        else -> "Other"
-    }
-
-    private fun buildDependencyText(finding: VulnerabilityFinding): String {
-        val primary = buildPrimaryDependencyText(finding)
-        val additionalCount = (finding.affectedDependencies.ifEmpty { finding.fallbackDependencies() }.size - 1).coerceAtLeast(0)
-        return if (additionalCount > 0) {
-            "$primary +$additionalCount"
-        } else {
-            primary
-        }
-    }
-
-    private fun buildPrimaryDependencyText(finding: VulnerabilityFinding): String {
-        val dependency = finding.affectedDependencies.firstOrNull() ?: finding.fallbackDependencies().firstOrNull()
-        if (dependency == null || dependency.name.isBlank()) {
-            return finding.ecosystem.name.lowercase()
-        }
-        val label = dependency.version?.takeIf { it.isNotBlank() }?.let { "${dependency.name}:$it" } ?: dependency.name
-        return if (label.contains("(") && label.contains(")")) {
-            label
-        } else {
-            "${label} (${finding.ecosystem.name.lowercase().replaceFirstChar { it.titlecase() }})"
-        }
-    }
-
-    private fun buildDependencySearchText(finding: VulnerabilityFinding): String {
-        val dependencies = finding.affectedDependencies.ifEmpty { finding.fallbackDependencies() }
-        return dependencies.joinToString(" ") { dependency ->
-            dependency.version?.takeIf { it.isNotBlank() }?.let { "${dependency.name} $it" } ?: dependency.name
-        }
-    }
-}
-
-private fun VulnerabilityFinding.displaySeverity(): Severity = when {
-    severity != Severity.UNKNOWN -> severity
-    cvss3Score != null -> when {
-        cvss3Score >= 9.0 -> Severity.CRITICAL
-        cvss3Score >= 7.0 -> Severity.HIGH
-        cvss3Score >= 4.0 -> Severity.MEDIUM
-        cvss3Score > 0.0 -> Severity.LOW
-        else -> Severity.UNKNOWN
-    }
-    cvss2Score != null -> when {
-        cvss2Score >= 7.0 -> Severity.HIGH
-        cvss2Score >= 4.0 -> Severity.MEDIUM
-        cvss2Score > 0.0 -> Severity.LOW
-        else -> Severity.UNKNOWN
-    }
-    else -> Severity.UNKNOWN
-}
-
-private val DATE_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
-
-private fun VulnerabilityFinding.introducedDateText(): String {
-    val ts = introducedAt ?: return "Unknown"
-    return runCatching {
-        DATE_FORMATTER.format(Instant.ofEpochMilli(ts).atZone(ZoneId.systemDefault()).toLocalDate())
-    }.getOrElse { "Unknown" }
-}
-
-private fun VulnerabilityFinding.reviewStatusDisplay(): String {
-    val raw = reviewStatus ?: return "N/A"
-    return raw.replace('_', ' ').replaceFirstChar { it.titlecase() }
-}
-
-private fun VulnerabilityFinding.exploitedDisplay(): String = when (exploited) {
-    true -> "Yes"
-    false -> "No"
-    null -> "Unknown"
-}
-
-private fun VulnerabilityFinding.primaryIdentifier(): String = cveId ?: id
-
-private fun VulnerabilityFinding.cvssDetailsDisplay(): String {
-    val score = cvss3Score ?: cvss2Score ?: exploitabilityScore ?: return "Not available"
-    val version = when {
-        cvss3Score != null -> "CVSS3"
-        cvss2Score != null -> "CVSS2"
-        else -> "CVSS"
-    }
-    return "${DecimalFormat("0.0").format(score)} ($version)"
-}
-
-private fun VulnerabilityFinding.discoveredRelativeDisplay(): String {
-    val ts = introducedAt ?: return "Unknown"
-    return runCatching {
-        val days = Duration.between(Instant.ofEpochMilli(ts), Instant.now()).toDays().coerceAtLeast(0)
-        when {
-            days == 0L -> "Today"
-            days < 7 -> "$days day${if (days == 1L) "" else "s"} ago"
-            days < 30 -> {
-                val weeks = (days / 7).coerceAtLeast(1)
-                "$weeks week${if (weeks == 1L) "" else "s"} ago"
-            }
-            days < 365 -> {
-                val months = (days / 30).coerceAtLeast(1)
-                "$months month${if (months == 1L) "" else "s"} ago"
-            }
-            else -> {
-                val years = (days / 365).coerceAtLeast(1)
-                "$years year${if (years == 1L) "" else "s"} ago"
-            }
-        }
-    }.getOrElse { "Unknown" }
-}
-
-private fun VulnerabilityFinding.fallbackDependencies(): List<com.debricked.intellijplugin.domain.AffectedDependency> {
-    if (packageName.isBlank()) return emptyList()
-    return listOf(com.debricked.intellijplugin.domain.AffectedDependency(packageName, version.ifBlank { null }))
-}
-
 private class VulnerabilityDetailsPanel(
+    private val project: Project,
     private val onReviewStatusApply: (String, VulnerabilityReviewStatusInfo?) -> Unit
 ) : JPanel(BorderLayout()) {
     private val vulnerabilityCaptionLabel = JBLabel("Vulnerability").apply {
         foreground = JBColor(0xD81B60, 0xF06292)
     }
     private val titleLabel = JBLabel("Select a vulnerability").apply {
-        font = font.deriveFont(Font.BOLD, 28f)
+        font = font.deriveFont(Font.BOLD, 16f)
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        foreground = JBColor.BLUE
     }
     private val discoveredHeaderLabel = JBLabel("Discovered").apply {
-        font = font.deriveFont(Font.BOLD, 16f)
+        font = font.deriveFont(Font.BOLD, 12f)
     }
     private val identifierLabel = JBLabel("").apply { foreground = JBColor.GRAY }
     private val discoveredValueLabel = JBLabel("").apply { foreground = JBColor.GRAY }
     private val cvssLabel = JBLabel("")
     private val statusLabel = JBLabel("").apply { verticalAlignment = SwingConstants.TOP }
     private val dependenciesLabel = JBLabel("").apply { verticalAlignment = SwingConstants.TOP }
-    private val dependencyInlineLabel = JBLabel("").apply { verticalAlignment = SwingConstants.TOP }
+    private val dependencyInlinePrefixLabel = JBLabel("in dependency").apply {
+        foreground = JBColor.GRAY
+        font = font.deriveFont(Font.PLAIN)
+    }
+    private val dependencyInlineChipButton = JButton("").apply {
+        isOpaque = true
+        isContentAreaFilled = true
+        isFocusPainted = false
+        isBorderPainted = true
+        background = JBColor(0xFFFFFF, 0x2F3440)
+        foreground = JBColor(0x1F3F80, 0xC6DBFF)
+        font = font.deriveFont(Font.BOLD, 12f)
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        margin = Insets(0, 0, 0, 0)
+        horizontalAlignment = SwingConstants.LEFT
+        border = JBUI.Borders.compound(
+            JBUI.Borders.customLine(JBColor.border()),
+            JBUI.Borders.empty(3, 8)
+        )
+        // Dependency tab navigation is planned for a later phase.
+        toolTipText = "Dependency navigation will be available in a later phase"
+    }
+    private val dependencyInlinePanel = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(6), 0)).apply {
+        isOpaque = false
+        border = JBUI.Borders.emptyBottom(0)
+        add(dependencyInlinePrefixLabel)
+        add(dependencyInlineChipButton)
+    }
     private val fixedVersionLabel = JBLabel("")
     private val linkLabel = JBLabel("").apply {
         cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
@@ -1555,7 +1282,8 @@ private class VulnerabilityDetailsPanel(
     private val scanLabel = JBLabel("").apply { foreground = JBColor.GRAY }
     private val detailsStatusLabel = JBLabel("").apply { foreground = JBColor.GRAY }
     private val scoresArea = createDetailsArea()
-    private val scoreLabels = (0..5).map { JBLabel("") }
+    private val scoreLabels = (0..8).map { JBLabel("") }
+    private val scoreBoxPanel = JPanel()
     private val advisoryCardsPanel = JPanel(GridLayout(1, 3, JBUI.scale(12), 0)).apply {
         isOpaque = false
         alignmentX = TOP_ALIGNMENT
@@ -1563,11 +1291,11 @@ private class VulnerabilityDetailsPanel(
     private val cweCard = createAdvisoryCard("CWE")
     private val githubCard = createAdvisoryCard("GitHub")
     private val nvdCard = createAdvisoryCard("NVD")
-    private val introducedArea = createDetailsArea()
-    private val fixesArea = createDetailsArea()
-    private val referencesArea = createDetailsArea()
-    private val reachabilityArea = createDetailsArea()
-    private val reviewMetaArea = createDetailsArea()
+    private val actionsSectionBody = createSectionBodyPanel()
+    private val cisaKevSectionBody = createSectionBodyPanel()
+    private val introducedSectionBody = createSectionBodyPanel()
+    private val fixesSectionBody = createSectionBodyPanel()
+    private val referencesSectionBody = createSectionBodyPanel()
     private val reviewStatusCombo = ComboBox(arrayOf("unexamined", "vulnerable", "unaffected", "remediated")).apply {
         maximumSize = Dimension(JBUI.scale(180), preferredSize.height)
     }
@@ -1592,13 +1320,30 @@ private class VulnerabilityDetailsPanel(
     }
     private val sectionPanels = mutableListOf<JPanel>()
     private val sectionAreaToPanel = mutableMapOf<JTextArea, JPanel>()
+    private val sectionBodyToPanel = mutableMapOf<JPanel, JPanel>()
+    private val localProjectRepositoryIdentity by lazy { resolveLocalProjectRepositoryIdentity(project.basePath) }
+    private var renderedReferences = emptyList<VulnerabilityReferenceLink>()
+    private var renderedReferenceColumns = 0
     private var findingUrl: String? = null
     private var currentReviewInfo: VulnerabilityReviewStatusInfo? = null
+
+    private data class FileLocationInfo(
+        val repository: String,
+        val branch: String? = null
+    )
+
+    private data class FileNavigationTarget(
+        val url: String,
+        val label: String,
+        val generatedSource: Boolean = false,
+        val localPath: Path? = null,
+        val lineNumber: Int? = null
+    )
 
     private data class AdvisoryCard(
         val sourceName: String,
         val panel: JPanel,
-        val subtitleLabel: JBLabel,
+        val subtitleLabel: JTextArea,
         val bodyArea: JTextArea,
         val linkLabel: JBLabel,
         val moreDetailsButton: JButton,
@@ -1640,21 +1385,57 @@ private class VulnerabilityDetailsPanel(
                 add(discoveredValueLabel)
             }
             val scoresPanel = JPanel().apply {
-                layout = GridLayout(2, 3, JBUI.scale(8), JBUI.scale(4))
+                layout = GridLayout(3, 3, JBUI.scale(4), JBUI.scale(0))
                 isOpaque = false
                 alignmentX = TOP_ALIGNMENT
-                for (i in 0..2) {
-                    add(scoreLabels[i].apply {
+                preferredSize = Dimension(preferredSize.width, JBUI.scale(48))
+                // Row 1: Score values
+                add(scoreBoxPanel.apply {
+                    layout = BorderLayout()
+                    isOpaque = false
+                    add(scoreLabels[0].apply {
                         horizontalAlignment = SwingConstants.CENTER
                         font = font.deriveFont(Font.BOLD, 16f)
-                    })
-                }
-                for (i in 3..5) {
-                    add(scoreLabels[i].apply {
-                        horizontalAlignment = SwingConstants.CENTER
-                        font = font.deriveFont(Font.PLAIN, 10f)
-                    })
-                }
+                    }, BorderLayout.CENTER)
+                })
+                add(scoreLabels[1].apply {
+                    horizontalAlignment = SwingConstants.CENTER
+                    font = font.deriveFont(Font.BOLD, 16f)
+                })
+                add(scoreLabels[2].apply {
+                    horizontalAlignment = SwingConstants.CENTER
+                    font = font.deriveFont(Font.BOLD, 16f)
+                    foreground = JBColor.GRAY
+                })
+                // Row 2: CVSS version labels
+                add(scoreLabels[3].apply {
+                    horizontalAlignment = SwingConstants.CENTER
+                    font = font.deriveFont(Font.PLAIN, 9f)
+                })
+                add(scoreLabels[4].apply {
+                    horizontalAlignment = SwingConstants.CENTER
+                    font = font.deriveFont(Font.PLAIN, 9f)
+                })
+                add(scoreLabels[5].apply {
+                    horizontalAlignment = SwingConstants.CENTER
+                    font = font.deriveFont(Font.PLAIN, 9f)
+                })
+                // Row 3: Severity labels
+                add(scoreLabels[6].apply {
+                    horizontalAlignment = SwingConstants.CENTER
+                    font = font.deriveFont(Font.PLAIN, 9f)
+                    foreground = JBColor.GRAY
+                })
+                add(scoreLabels[7].apply {
+                    horizontalAlignment = SwingConstants.CENTER
+                    font = font.deriveFont(Font.PLAIN, 9f)
+                    foreground = JBColor.GRAY
+                })
+                add(scoreLabels[8].apply {
+                    horizontalAlignment = SwingConstants.CENTER
+                    font = font.deriveFont(Font.PLAIN, 9f)
+                    foreground = JBColor.GRAY
+                })
             }
             add(leftPanel)
             add(discoveredPanel)
@@ -1664,38 +1445,33 @@ private class VulnerabilityDetailsPanel(
         add(Box.createVerticalStrut(8))
         add(emptyStateLabel)
         add(Box.createVerticalStrut(8))
-        add(dependencyInlineLabel)
+        add(dependencyInlinePanel)
         add(Box.createVerticalStrut(10))
         advisoryCardsPanel.add(cweCard.panel)
         advisoryCardsPanel.add(githubCard.panel)
         advisoryCardsPanel.add(nvdCard.panel)
         summaryRowPanel.add(advisoryCardsPanel, BorderLayout.CENTER)
         add(summaryRowPanel)
-        add(Box.createVerticalStrut(10))
-        add(identifierLabel)
-        add(Box.createVerticalStrut(8))
-        add(cvssLabel)
-        add(Box.createVerticalStrut(8))
-        add(statusLabel)
-        add(Box.createVerticalStrut(10))
-        add(dependenciesLabel)
-        add(Box.createVerticalStrut(12))
-        add(fixedVersionLabel)
-        add(Box.createVerticalStrut(8))
-        add(linkLabel)
-        add(Box.createVerticalStrut(8))
-        add(scanLabel)
+        //add(Box.createVerticalStrut(10))
+        //add(identifierLabel)
+        //add(Box.createVerticalStrut(8))
+        //add(cvssLabel)
+        //add(Box.createVerticalStrut(8))
+        //add(statusLabel)
         add(Box.createVerticalStrut(8))
         add(detailsStatusLabel)
-        addSection("Introduced through", introducedArea)
-        addSection("Suggested fixes", fixesArea)
-        addSection("References", referencesArea)
-        addSection("Reachability details", reachabilityArea)
-        addSection("Review details", reviewMetaArea)
-        add(Box.createVerticalStrut(6))
-        add(reviewActionPanel)
+        addSection("Actions", actionsSectionBody)
+        addSection("CISA KEV", cisaKevSectionBody)
+        addSection("Introduced through", introducedSectionBody)
+        addSection("Suggested fixes", fixesSectionBody)
+        addSection("References", referencesSectionBody)
 
         linkLabel.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(event: MouseEvent) {
+                findingUrl?.let { BrowserUtil.browse(it) }
+            }
+        })
+        titleLabel.addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(event: MouseEvent) {
                 findingUrl?.let { BrowserUtil.browse(it) }
             }
@@ -1725,7 +1501,7 @@ private class VulnerabilityDetailsPanel(
         listOf(
             headlinePanel,
             emptyStateLabel,
-            dependencyInlineLabel,
+            dependencyInlinePanel,
             summaryRowPanel,
             identifierLabel,
             cvssLabel,
@@ -1734,15 +1510,19 @@ private class VulnerabilityDetailsPanel(
             fixedVersionLabel,
             linkLabel,
             scanLabel,
-            detailsStatusLabel,
-            reviewActionPanel
+            detailsStatusLabel
         ).forEach { component ->
             component.alignmentX = LEFT_ALIGNMENT
         }
+        referencesSectionBody.addComponentListener(object : ComponentAdapter() {
+            override fun componentResized(e: ComponentEvent) {
+                rerenderReferencesIfNeeded()
+            }
+        })
         renderEmptyState()
     }
 
-    fun setFinding(finding: VulnerabilityFinding?, context: DebrickedScanContext?) {
+    fun setFinding(finding: VulnerabilityFinding?) {
         if (finding == null) {
             renderEmptyState()
             return
@@ -1750,15 +1530,15 @@ private class VulnerabilityDetailsPanel(
 
         headlinePanel.isVisible = true
         emptyStateLabel.isVisible = false
-        dependencyInlineLabel.isVisible = true
+        dependencyInlinePanel.isVisible = true
         summaryRowPanel.isVisible = true
         identifierLabel.isVisible = true
         discoveredValueLabel.isVisible = true
         cvssLabel.isVisible = true
         statusLabel.isVisible = true
-        dependenciesLabel.isVisible = true
-        fixedVersionLabel.isVisible = true
-        scanLabel.isVisible = true
+        dependenciesLabel.isVisible = false
+        fixedVersionLabel.isVisible = false
+        scanLabel.isVisible = false
         reviewActionPanel.isVisible = true
         sectionPanels.forEach { it.isVisible = false }
         currentReviewInfo = null
@@ -1766,18 +1546,12 @@ private class VulnerabilityDetailsPanel(
         val id = finding.primaryIdentifier()
         val title = finding.title?.takeIf { it.isNotBlank() && !it.equals(id, ignoreCase = true) } ?: id
         titleLabel.text = title
-        discoveredValueLabel.text = buildString {
-            append(finding.discoveredRelativeDisplay())
-            val discoveredDate = finding.introducedDateText()
-            if (discoveredDate != "Unknown") {
-                append(" • ")
-                append(discoveredDate)
-            }
-        }
+        discoveredValueLabel.text = finding.discoveredRelativeDisplay()
         identifierLabel.text = "Identifier: $id"
         val dependencies = finding.affectedDependencies.ifEmpty { finding.fallbackDependencies() }
         val firstDependency = dependencies.firstOrNull()?.name ?: "Unknown dependency"
-        dependencyInlineLabel.text = htmlText("in dependency <b>${htmlEscape(firstDependency)}</b>")
+        dependencyInlineChipButton.text = buildDependencyInlineChipText(firstDependency)
+        dependencyInlineChipButton.toolTipText = "Dependency navigation will be available in a later phase"
         cvssLabel.text = "Severity: ${finding.displaySeverity()} • CVSS: ${finding.cvssDetailsDisplay()}"
         statusLabel.text = htmlText(
             buildString {
@@ -1792,22 +1566,11 @@ private class VulnerabilityDetailsPanel(
                 }
             }
         )
-        dependenciesLabel.text = htmlText(
-            buildString {
-                append("<b>Affected dependencies:</b><br/>")
-                append(dependencies.joinToString("<br/>") { dependency ->
-                    val version = dependency.version?.takeIf { it.isNotBlank() }?.let { ":$it" } ?: ""
-                    htmlEscape("${dependency.name}$version")
-                })
-            }
-        )
         renderSummarySources(emptyList())
-        fixedVersionLabel.text = "Fixed version: ${finding.fixedVersion ?: "Not provided"}"
         reviewStatusCombo.selectedItem = finding.reviewStatus ?: "unexamined"
         findingUrl = buildFindingUrl(finding)
-        linkLabel.text = "<html><a href=''>${htmlEscape("Open in Debricked UI")}</a></html>"
-        linkLabel.isVisible = findingUrl != null
-        scanLabel.text = contextSummary(context)
+        linkLabel.isVisible = false
+        scanLabel.text = ""
         detailsStatusLabel.text = "Loading details..."
         detailsStatusLabel.isVisible = true
         setBusy(true)
@@ -1830,26 +1593,15 @@ private class VulnerabilityDetailsPanel(
         detailsStatusLabel.text = ""
         detailsStatusLabel.isVisible = false
         setBusy(false)
-        val dependencies = bundle.affectedDependencies.ifEmpty { finding.affectedDependencies.ifEmpty { finding.fallbackDependencies() } }
-        dependenciesLabel.text = htmlText(
-            buildString {
-                append("<b>Affected dependencies:</b><br/>")
-                append(dependencies.joinToString("<br/>") { dependency ->
-                    val version = dependency.version?.takeIf { it.isNotBlank() }?.let { ":$it" } ?: ""
-                    htmlEscape("${dependency.name}$version")
-                })
-            }
-        )
-        fixedVersionLabel.text = buildFixHeadline(finding, bundle.rootFixes)
         scoresArea.text = buildCompactScoreSummaryText(bundle.scoreSummaries)
         renderSummarySources(bundle.summarySources)
-        introducedArea.text = buildIntroducedThroughText(bundle.files, bundle.dependencyTree)
-        fixesArea.text = buildRootFixText(bundle.rootFixes)
-        referencesArea.text = buildReferencesText(bundle.references)
-        reachabilityArea.text = buildReachabilityText(finding, bundle)
-        reviewMetaArea.text = buildReviewMetaText(context, finding, bundle)
         currentReviewInfo = bundle.reviewStatusInfo
         reviewStatusCombo.selectedItem = resolveDisplayedReviewStatus(context, finding, bundle)
+        renderActionsSection(context, finding, bundle)
+        renderCisaKevSection(finding, bundle)
+        renderIntroducedThroughSection(bundle)
+        renderSuggestedFixesSection(bundle)
+        renderReferencesSection(bundle.references)
         updateSectionVisibility()
         scrollToTop()
         revalidate()
@@ -1865,8 +1617,8 @@ private class VulnerabilityDetailsPanel(
     private fun renderEmptyState() {
         headlinePanel.isVisible = false
         emptyStateLabel.isVisible = true
-        dependencyInlineLabel.text = ""
-        dependencyInlineLabel.isVisible = false
+        dependencyInlineChipButton.text = ""
+        dependencyInlinePanel.isVisible = false
         summaryRowPanel.isVisible = false
         identifierLabel.text = ""
         identifierLabel.isVisible = false
@@ -1899,11 +1651,13 @@ private class VulnerabilityDetailsPanel(
     private fun clearDetailsSections() {
         scoresArea.text = ""
         renderSummarySources(emptyList())
-        introducedArea.text = ""
-        fixesArea.text = ""
-        referencesArea.text = ""
-        reachabilityArea.text = ""
-        reviewMetaArea.text = ""
+        actionsSectionBody.removeAll()
+        cisaKevSectionBody.removeAll()
+        introducedSectionBody.removeAll()
+        fixesSectionBody.removeAll()
+        referencesSectionBody.removeAll()
+        renderedReferences = emptyList()
+        renderedReferenceColumns = 0
     }
 
     private fun setBusy(isBusy: Boolean) {
@@ -1920,23 +1674,26 @@ private class VulnerabilityDetailsPanel(
         applyReviewStatusButton.isEnabled = !isBusy
     }
 
-    private fun addSection(title: String, area: JTextArea) {
+    private fun addSection(title: String, content: JComponent) {
         val sectionPanel = JPanel().apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             isOpaque = false
             alignmentX = LEFT_ALIGNMENT
             isVisible = false
-            add(Box.createVerticalStrut(12))
+            add(Box.createVerticalStrut(8))
             add(JBLabel(title).apply {
                 font = font.deriveFont(Font.BOLD)
                 alignmentX = LEFT_ALIGNMENT
             })
             add(Box.createVerticalStrut(4))
-            add(area)
+            add(content)
         }
-        area.alignmentX = LEFT_ALIGNMENT
+        content.alignmentX = LEFT_ALIGNMENT
         sectionPanels += sectionPanel
-        sectionAreaToPanel[area] = sectionPanel
+        when (content) {
+            is JTextArea -> sectionAreaToPanel[content] = sectionPanel
+            is JPanel -> sectionBodyToPanel[content] = sectionPanel
+        }
         add(sectionPanel)
     }
 
@@ -1944,6 +1701,15 @@ private class VulnerabilityDetailsPanel(
         sectionAreaToPanel.forEach { (area, panel) ->
             panel.isVisible = area.text.isNotBlank()
         }
+        sectionBodyToPanel.forEach { (body, panel) ->
+            panel.isVisible = body.componentCount > 0
+        }
+    }
+
+    private fun createSectionBodyPanel(): JPanel = JPanel().apply {
+        layout = BoxLayout(this, BoxLayout.Y_AXIS)
+        isOpaque = false
+        alignmentX = LEFT_ALIGNMENT
     }
 
     private fun createDetailsArea(): JTextArea = JTextArea().apply {
@@ -1956,11 +1722,888 @@ private class VulnerabilityDetailsPanel(
         alignmentX = LEFT_ALIGNMENT
     }
 
-    private fun createAdvisoryCard(sourceName: String): AdvisoryCard {
-        val subtitleLabel = JBLabel().apply {
-            font = font.deriveFont(Font.BOLD)
+    private fun createAdvisoryTitleArea(): JTextArea = createDetailsArea().apply {
+        font = font.deriveFont(Font.BOLD)
+        cursor = Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR)
+        isFocusable = false
+        maximumSize = Dimension(Int.MAX_VALUE, Int.MAX_VALUE)
+    }
+
+    private fun createCardPanel(): JPanel = JPanel().apply {
+        layout = BoxLayout(this, BoxLayout.Y_AXIS)
+        isOpaque = false
+        alignmentX = LEFT_ALIGNMENT
+        border = JBUI.Borders.compound(
+            JBUI.Borders.customLine(JBColor.border()),
+            JBUI.Borders.empty(10)
+        )
+        maximumSize = Dimension(Int.MAX_VALUE, Int.MAX_VALUE)
+    }
+
+    private fun createPill(text: String, background: JBColor, foreground: JBColor = JBColor.WHITE): JBLabel = JBLabel(text).apply {
+        this.background = background
+        this.foreground = foreground
+        isOpaque = true
+        border = JBUI.Borders.empty(3, 10)
+    }
+
+    private fun createWrappedInfoArea(
+        text: String,
+        bold: Boolean = false,
+        foreground: Color = JBColor.foreground(),
+        monospace: Boolean = false
+    ): JTextArea = createDetailsArea().apply {
+        this.text = text
+        this.foreground = foreground
+        font = when {
+            monospace -> Font(Font.MONOSPACED, if (bold) Font.BOLD else Font.PLAIN, font.size)
+            bold -> font.deriveFont(Font.BOLD)
+            else -> font.deriveFont(Font.PLAIN)
+        }
+        maximumSize = Dimension(Int.MAX_VALUE, Int.MAX_VALUE)
+    }
+
+    private fun createLinkArea(
+        text: String,
+        url: String,
+        bold: Boolean = false,
+        monospace: Boolean = false
+    ): JTextArea = createWrappedInfoArea(
+        text = text,
+        bold = bold,
+        foreground = JBColor.BLUE,
+        monospace = monospace
+    ).apply {
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(event: MouseEvent) {
+                BrowserUtil.browse(url)
+            }
+        })
+    }
+
+    private fun renderIntroducedThroughSection(bundle: VulnerabilityDetailsBundle) {
+        introducedSectionBody.removeAll()
+
+        val rootFixCount = bundle.rootFixes?.rootFixesCount ?: bundle.rootFixes?.fixes?.size ?: 0
+        if (rootFixCount > 0) {
+            val summaryRow = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(8), 0)).apply {
+                isOpaque = false
+                alignmentX = LEFT_ALIGNMENT
+                add(createPill(rootFixCount.toString(), JBColor(0x22B35A, 0x2F8F4E)))
+                add(JBLabel(if (rootFixCount == 1) "Direct dependency to update" else "Direct dependencies to update").apply {
+                    foreground = JBColor.GRAY
+                })
+            }
+            introducedSectionBody.add(summaryRow)
+            introducedSectionBody.add(Box.createVerticalStrut(8))
+        }
+
+        if (bundle.files.isNotEmpty()) {
+            val metaRow = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(8), 0)).apply {
+                isOpaque = false
+                alignmentX = LEFT_ALIGNMENT
+                add(JBLabel("${bundle.files.size} file${if (bundle.files.size == 1) "" else "s"}").apply {
+                    foreground = JBColor.GRAY
+                    font = font.deriveFont(Font.BOLD)
+                })
+            }
+            introducedSectionBody.add(metaRow)
+            introducedSectionBody.add(Box.createVerticalStrut(6))
+            bundle.files.forEachIndexed { index, file ->
+                introducedSectionBody.add(createIntroducedFileCard(file))
+                if (index < bundle.files.lastIndex) {
+                    introducedSectionBody.add(Box.createVerticalStrut(8))
+                }
+            }
+        }
+
+        val paths = bundle.dependencyTree?.roots?.flatMap { flattenDependencyPaths(it) }.orEmpty()
+        if (paths.isNotEmpty()) {
+            if (introducedSectionBody.componentCount > 0) {
+                introducedSectionBody.add(Box.createVerticalStrut(10))
+            }
+            introducedSectionBody.add(JBLabel("Dependency path").apply {
+                foreground = JBColor.GRAY
+                font = font.deriveFont(Font.BOLD, 11f)
+                alignmentX = LEFT_ALIGNMENT
+            })
+            introducedSectionBody.add(Box.createVerticalStrut(4))
+            paths.take(6).forEachIndexed { index, path ->
+                introducedSectionBody.add(createCardPanel().apply {
+                    add(createWrappedInfoArea(path.joinToString(" -> "), monospace = true))
+                })
+                if (index < minOf(paths.lastIndex, 5)) {
+                    introducedSectionBody.add(Box.createVerticalStrut(6))
+                }
+            }
+        }
+    }
+
+    private fun renderActionsSection(
+        context: VulnerabilityDetailsContext,
+        finding: VulnerabilityFinding,
+        bundle: VulnerabilityDetailsBundle
+    ) {
+        actionsSectionBody.removeAll()
+
+        val cards = JPanel(GridLayout(1, 2, JBUI.scale(12), 0)).apply {
+            isOpaque = false
             alignmentX = LEFT_ALIGNMENT
         }
+        cards.add(createReviewActionCard(context, finding, bundle))
+        cards.add(createFixActionCard(bundle))
+        actionsSectionBody.add(cards)
+    }
+
+    private fun createReviewActionCard(
+        context: VulnerabilityDetailsContext,
+        finding: VulnerabilityFinding,
+        bundle: VulnerabilityDetailsBundle
+    ): JPanel {
+        val repositoryName = bundle.repositoryStatuses.firstOrNull { it.id == context.repositoryId }?.name ?: context.repositoryId
+        val displayedStatus = resolveDisplayedReviewStatus(context, finding, bundle)
+        return createCardPanel().apply {
+            background = JBColor(0xF4F6FF, 0x2E3240)
+            isOpaque = true
+            add(JBLabel("Review status for").apply {
+                font = font.deriveFont(Font.BOLD, 12f)
+                alignmentX = LEFT_ALIGNMENT
+            })
+            add(Box.createVerticalStrut(8))
+            add(createPill(repositoryName, JBColor(0xFFFFFF, 0x3B4152), JBColor(0x2F4A7D, 0xD6E4FF)).apply {
+                alignmentX = LEFT_ALIGNMENT
+            })
+            add(Box.createVerticalStrut(10))
+            add(JBLabel("Current: ${displayedStatus.replaceFirstChar { it.titlecase() }}").apply {
+                foreground = when (displayedStatus.lowercase()) {
+                    "vulnerable" -> JBColor(0xE91E63, 0xFF7BA5)
+                    "unaffected", "remediated" -> JBColor(0x2E7D32, 0x8ED694)
+                    else -> JBColor.foreground()
+                }
+                font = font.deriveFont(Font.BOLD, 12f)
+                alignmentX = LEFT_ALIGNMENT
+            })
+            add(Box.createVerticalStrut(10))
+            add(reviewActionPanel.apply {
+                alignmentX = LEFT_ALIGNMENT
+            })
+        }
+    }
+
+    private fun createFixActionCard(bundle: VulnerabilityDetailsBundle): JPanel {
+        val fixCount = bundle.rootFixes?.rootFixesCount ?: bundle.rootFixes?.fixes?.size ?: 0
+        return createCardPanel().apply {
+            background = JBColor(0xEFFAF0, 0x243527)
+            isOpaque = true
+            add(JBLabel("Fix vulnerabilities").apply {
+                font = font.deriveFont(Font.BOLD, 12f)
+                alignmentX = LEFT_ALIGNMENT
+            })
+            add(Box.createVerticalStrut(10))
+            val summaryRow = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(8), 0)).apply {
+                isOpaque = false
+                alignmentX = LEFT_ALIGNMENT
+                add(createPill(fixCount.toString(), JBColor(0x1FB655, 0x2F8F4E)).apply {
+                    foreground = JBColor.WHITE
+                })
+                add(JBLabel(if (fixCount == 1) "Direct dependency to update" else "Direct dependencies to update").apply {
+                    foreground = JBColor.GRAY
+                })
+            }
+            add(summaryRow)
+            add(Box.createVerticalStrut(12))
+            add(JButton("Full fix details ›").apply {
+                alignmentX = LEFT_ALIGNMENT
+                isOpaque = false
+                isContentAreaFilled = false
+                isBorderPainted = false
+                border = JBUI.Borders.empty()
+                foreground = JBColor.BLUE
+                cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                addActionListener { scrollToSection(fixesSectionBody) }
+            })
+        }
+    }
+
+    private fun renderCisaKevSection(
+        finding: VulnerabilityFinding,
+        bundle: VulnerabilityDetailsBundle
+    ) {
+        cisaKevSectionBody.removeAll()
+
+        val showReachabilityCard = hasReachabilityAnalysisResult(bundle)
+        val cards = JPanel(GridLayout(1, if (showReachabilityCard) 2 else 1, JBUI.scale(12), 0)).apply {
+            isOpaque = false
+            alignmentX = LEFT_ALIGNMENT
+        }
+        cards.add(createCardPanel().apply {
+            background = JBColor(0xFFFFFF, 0x2E2E2E)
+            isOpaque = true
+            add(JBLabel(if (finding.exploited == true) "Known exploit reported" else "No exploit reported").apply {
+                font = font.deriveFont(Font.BOLD, 12f)
+                alignmentX = LEFT_ALIGNMENT
+                foreground = if (finding.exploited == true) {
+                    JBColor(0xD32F2F, 0xFF8A80)
+                } else {
+                    JBColor.foreground()
+                }
+            })
+            add(Box.createVerticalStrut(8))
+            add(JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(8), 0)).apply {
+                isOpaque = false
+                alignmentX = LEFT_ALIGNMENT
+                add(JBLabel().apply {
+                    icon = if (finding.exploited == true) AllIcons.General.Warning else AllIcons.Actions.Checked
+                })
+                add(JBLabel(
+                    when (finding.exploited) {
+                        true -> "CISA flagged this vulnerability as exploited"
+                        false -> "CISA KEV currently shows no exploit reported"
+                        null -> "Exploit status is currently unknown"
+                    }
+                ).apply {
+                    foreground = JBColor.GRAY
+                })
+            })
+        })
+        if (showReachabilityCard) {
+            cards.add(createReachabilityAnalysisCard(bundle.reachabilityDetails!!, finding))
+        }
+        cisaKevSectionBody.add(cards)
+    }
+
+    private fun hasReachabilityAnalysisResult(bundle: VulnerabilityDetailsBundle): Boolean {
+        val details = bundle.reachabilityDetails ?: return false
+        if (!details.supported) return false
+        return !details.reachAnalysis.isNullOrBlank() ||
+            !details.reachAnalysisMessage.isNullOrBlank() ||
+            !details.reachAnalysisLanguage.isNullOrBlank()
+    }
+
+    private fun createReachabilityAnalysisCard(
+        details: com.debricked.intellijplugin.domain.VulnerabilityReachabilityDetails,
+        finding: VulnerabilityFinding
+    ): JPanel = createCardPanel().apply {
+        val status = finding.reachablePath?.takeIf { it.isNotBlank() } ?: "Unknown"
+        val isReachable = status.contains("reachable", ignoreCase = true) && !status.contains("not", ignoreCase = true)
+
+        background = JBColor(0xFFFFFF, 0x2E2E2E)
+        isOpaque = true
+        add(JBLabel("Reachability analysis").apply {
+            font = font.deriveFont(Font.BOLD, 12f)
+            alignmentX = LEFT_ALIGNMENT
+        })
+        add(Box.createVerticalStrut(8))
+        add(JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(8), 0)).apply {
+            isOpaque = false
+            alignmentX = LEFT_ALIGNMENT
+            add(JBLabel().apply {
+                icon = if (isReachable) AllIcons.General.Warning else AllIcons.Actions.Checked
+            })
+            add(JBLabel("List status: $status").apply {
+                foreground = if (isReachable) JBColor(0xD32F2F, 0xFF8A80) else JBColor.GRAY
+            })
+        })
+        details.reachAnalysis?.takeIf { it.isNotBlank() }?.let {
+            add(Box.createVerticalStrut(6))
+            add(createWrappedInfoArea("Analysis score: $it", bold = true))
+        }
+        details.reachAnalysisLanguage?.takeIf { it.isNotBlank() }?.let {
+            add(Box.createVerticalStrut(4))
+            add(createWrappedInfoArea("Language: $it", foreground = JBColor.GRAY))
+        }
+        details.reachAnalysisMessage?.takeIf { it.isNotBlank() }?.let {
+            add(Box.createVerticalStrut(6))
+            add(createWrappedInfoArea(it))
+        }
+    }
+
+    private fun createLinkButton(text: String, url: String): JButton = JButton(text).apply {
+        alignmentX = LEFT_ALIGNMENT
+        isOpaque = false
+        isContentAreaFilled = false
+        isBorderPainted = false
+        border = JBUI.Borders.empty()
+        foreground = JBColor.BLUE
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        toolTipText = url
+        addActionListener { BrowserUtil.browse(url) }
+    }
+
+    private fun createNavigationButton(text: String, target: FileNavigationTarget): JButton = JButton(text).apply {
+        alignmentX = LEFT_ALIGNMENT
+        isOpaque = false
+        isContentAreaFilled = false
+        isBorderPainted = false
+        border = JBUI.Borders.empty()
+        foreground = JBColor.BLUE
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        toolTipText = target.localPath?.toString() ?: target.url
+        addActionListener { openNavigationTarget(target) }
+    }
+
+    private fun createNavigationArea(
+        text: String,
+        target: FileNavigationTarget,
+        bold: Boolean = false,
+        monospace: Boolean = false
+    ): JTextArea = createWrappedInfoArea(
+        text = text,
+        bold = bold,
+        foreground = JBColor.BLUE,
+        monospace = monospace
+    ).apply {
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        toolTipText = target.localPath?.toString() ?: target.url
+        addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(event: MouseEvent) {
+                openNavigationTarget(target)
+            }
+        })
+    }
+
+    private fun openNavigationTarget(target: FileNavigationTarget) {
+        val openedLocally = target.localPath?.let { openLocalFile(it, target.lineNumber) } == true
+        if (!openedLocally) {
+            BrowserUtil.browse(target.url)
+        }
+    }
+
+    private fun openLocalFile(path: Path, lineNumber: Int?): Boolean {
+        val ioFile = path.toFile()
+        if (!ioFile.exists()) return false
+        val virtualFile = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(ioFile) ?: return false
+        val descriptor = OpenFileDescriptor(project, virtualFile, lineNumber ?: 0, 0)
+        FileEditorManager.getInstance(project).openTextEditor(descriptor, true)
+        return true
+    }
+
+    private fun createIntroducedFileCard(file: VulnerabilityFileRef): JPanel = createCardPanel().apply {
+        val navigationTarget = resolveFileNavigationTarget(file)
+        val locationInfo = navigationTarget?.url?.let { parseFileLocationInfo(it) }
+        add(JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            isOpaque = false
+            alignmentX = LEFT_ALIGNMENT
+            add(JPanel(BorderLayout(JBUI.scale(8), 0)).apply {
+                isOpaque = false
+                alignmentX = LEFT_ALIGNMENT
+                add(JPanel(BorderLayout(JBUI.scale(8), 0)).apply {
+                    isOpaque = false
+                    add(JBLabel().apply {
+                        icon = AllIcons.FileTypes.Any_type
+                        border = JBUI.Borders.empty(2, 0, 0, 0)
+                    }, BorderLayout.WEST)
+                    add(
+                        navigationTarget
+                            ?.let { createNavigationArea(file.name, it, bold = true, monospace = true) }
+                            ?: createWrappedInfoArea(file.name, bold = true, monospace = true),
+                        BorderLayout.CENTER
+                    )
+                }, BorderLayout.CENTER)
+                navigationTarget?.let {
+                    val actionLabel = when {
+                        it.localPath != null && it.generatedSource -> "Open ${it.label} in Editor"
+                        it.localPath != null -> "Open in Editor"
+                        it.generatedSource -> "Open ${it.label} ↗"
+                        else -> "View in File ↗"
+                    }
+                    add(JPanel(BorderLayout()).apply {
+                        isOpaque = false
+                        add(createNavigationButton(actionLabel, it).apply {
+                            horizontalAlignment = SwingConstants.RIGHT
+                        }, BorderLayout.NORTH)
+                    }, BorderLayout.EAST)
+                }
+            })
+            navigationTarget?.let {
+                add(Box.createVerticalStrut(4))
+                add(createWrappedInfoArea(it.localPath?.toString() ?: it.url, foreground = JBColor.GRAY))
+                if (it.generatedSource) {
+                    add(Box.createVerticalStrut(4))
+                    add(createWrappedInfoArea("Generated by Debricked from ${it.label}", foreground = JBColor.GRAY))
+                }
+            }
+            locationInfo?.let { info ->
+                add(Box.createVerticalStrut(6))
+                add(createFileMetaRow(info))
+            }
+        })
+    }
+
+    private fun resolveFileNavigationTarget(file: VulnerabilityFileRef): FileNavigationTarget? {
+        val originalUrl = file.url?.takeIf { it.isNotBlank() } ?: return null
+        val remappedManifest = resolveGeneratedLockManifest(file.name, originalUrl)
+        if (remappedManifest == null) {
+            return FileNavigationTarget(
+                url = originalUrl,
+                label = file.name,
+                localPath = resolveLocalFilePath(originalUrl),
+                lineNumber = extractLineNumber(originalUrl)
+            )
+        }
+        val remappedUrl = remappedManifest.first
+        return FileNavigationTarget(
+            url = remappedUrl,
+            label = remappedManifest.second,
+            generatedSource = true,
+            localPath = resolveLocalFilePath(remappedUrl),
+            lineNumber = extractLineNumber(remappedUrl)
+        )
+    }
+
+    private fun resolveGeneratedLockManifest(fileName: String, originalUrl: String): Pair<String, String>? {
+        val candidateNames = generatedLockManifestCandidates(fileName) ?: return null
+        val resolvedManifest = chooseManifestCandidate(originalUrl, candidateNames) ?: return null
+        return replaceUrlFileName(originalUrl, resolvedManifest) to resolvedManifest
+    }
+
+    private fun generatedLockManifestCandidates(fileName: String): List<String>? = when (fileName.lowercase()) {
+        "gradle.debricked.lock" -> listOf("build.gradle", "build.gradle.kts")
+        "maven.debricked.lock" -> listOf("pom.xml")
+        "pip.debricked.lock" -> listOf("requirements.txt", "pyproject.toml", "Pipfile")
+        else -> null
+    }
+
+    private fun chooseManifestCandidate(originalUrl: String, candidates: List<String>): String? {
+        val locationInfo = parseFileLocationInfo(originalUrl)
+        val relativeDirectory = extractRepositoryRelativeDirectory(originalUrl)
+        val basePath = project.basePath
+        if (basePath != null && shouldUseLocalManifestHints(locationInfo, basePath)) {
+            candidates.firstOrNull { candidate ->
+                val localPath = relativeDirectory
+                    ?.let { Path.of(basePath, it, candidate) }
+                    ?: Path.of(basePath, candidate)
+                Files.exists(localPath)
+            }?.let { return it }
+        }
+        return candidates.firstOrNull()
+    }
+
+    private fun shouldUseLocalManifestHints(locationInfo: FileLocationInfo?, basePath: String): Boolean {
+        val remoteRepositoryIdentity = normalizeRepositoryIdentity(locationInfo?.repository) ?: return false
+        val localRepositoryIdentity = localProjectRepositoryIdentity
+            ?: File(basePath).name.takeIf { it.isNotBlank() }
+        return remoteRepositoryIdentity.equals(localRepositoryIdentity, ignoreCase = true)
+    }
+
+    private fun resolveLocalProjectRepositoryIdentity(basePath: String?): String? {
+        if (basePath.isNullOrBlank()) return null
+        val remoteUrl = runCatching {
+            val process = ProcessBuilder("git", "-C", basePath, "config", "--get", "remote.origin.url")
+                .redirectErrorStream(true)
+                .start()
+            if (!process.waitFor(2, TimeUnit.SECONDS) || process.exitValue() != 0) {
+                process.destroyForcibly()
+                return@runCatching null
+            }
+            process.inputStream.bufferedReader().use { it.readText().trim() }
+        }.getOrNull().orEmpty()
+        return normalizeRepositoryIdentity(remoteUrl)
+    }
+
+    private fun normalizeRepositoryIdentity(repository: String?): String? {
+        if (repository.isNullOrBlank()) return null
+        val trimmed = repository.trim().removeSuffix("/")
+        val path = when {
+            trimmed.startsWith("git@") -> trimmed.substringAfter(':', "")
+            else -> runCatching { URI(trimmed).path.trim('/') }.getOrNull().orEmpty()
+        }.removeSuffix(".git")
+        if (path.isBlank()) return null
+        val segments = path.split('/').filter { it.isNotBlank() }
+        return when {
+            segments.size >= 2 -> segments.takeLast(2).joinToString("/")
+            segments.isNotEmpty() -> segments.last()
+            else -> null
+        }
+    }
+
+    private fun resolveLocalFilePath(url: String): Path? {
+        val basePath = project.basePath ?: return null
+        val locationInfo = parseFileLocationInfo(url)
+        if (!shouldUseLocalManifestHints(locationInfo, basePath)) return null
+        val relativeDirectory = extractRepositoryRelativeDirectory(url)
+        val fileName = runCatching { URI(url).path.substringAfterLast('/') }.getOrNull()?.takeIf { it.isNotBlank() } ?: return null
+        val path = relativeDirectory
+            ?.let { Path.of(basePath, it, fileName) }
+            ?: Path.of(basePath, fileName)
+        return path.takeIf { Files.exists(it) }
+    }
+
+    private fun extractLineNumber(url: String): Int? {
+        val fragment = runCatching { URI(url).fragment }.getOrNull() ?: return null
+        val match = Regex("L(\\d+)").find(fragment) ?: return null
+        return match.groupValues.getOrNull(1)?.toIntOrNull()?.minus(1)?.coerceAtLeast(0)
+    }
+
+    private fun extractRepositoryRelativeDirectory(url: String): String? {
+        val pathSegments = runCatching { URI(url).path.trim('/').split('/').filter { it.isNotBlank() } }.getOrNull() ?: return null
+        val fileSegments = when {
+            pathSegments.size >= 5 && pathSegments[2] == "blob" -> pathSegments.drop(4)
+            pathSegments.size >= 6 && pathSegments[2] == "-" && pathSegments[3] == "blob" -> pathSegments.drop(5)
+            else -> return null
+        }
+        return fileSegments.dropLast(1).takeIf { it.isNotEmpty() }?.joinToString(Path.of(".").fileSystem.separator)
+    }
+
+    private fun replaceUrlFileName(url: String, newFileName: String): String {
+        val lastSlashIndex = url.lastIndexOf('/')
+        if (lastSlashIndex < 0) return url
+        return url.substring(0, lastSlashIndex + 1) + newFileName
+    }
+
+    private fun createFileMetaRow(info: FileLocationInfo): JPanel = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(8), 0)).apply {
+        isOpaque = false
+        alignmentX = LEFT_ALIGNMENT
+        add(JBLabel().apply {
+            icon = AllIcons.Nodes.Folder
+        })
+        add(JBLabel(info.repository).apply {
+            foreground = JBColor.GRAY
+        })
+        info.branch?.takeIf { it.isNotBlank() }?.let { branch ->
+            add(JBLabel("•").apply { foreground = JBColor.GRAY })
+            add(createPill(branch, JBColor(0xEEF2F7, 0x313C4D), JBColor(0x44566C, 0xD9E4F5)))
+        }
+    }
+
+    private fun parseFileLocationInfo(url: String): FileLocationInfo? {
+        return runCatching {
+            val pathSegments = URI(url).path.trim('/').split('/').filter { it.isNotBlank() }
+            when {
+                pathSegments.size >= 5 && pathSegments[2] == "blob" -> FileLocationInfo(
+                    repository = "${pathSegments[0]}/${pathSegments[1]}",
+                    branch = pathSegments[3]
+                )
+                pathSegments.size >= 6 && pathSegments[2] == "-" && pathSegments[3] == "blob" -> FileLocationInfo(
+                    repository = pathSegments.take(2).joinToString("/"),
+                    branch = pathSegments[4]
+                )
+                else -> null
+            }
+        }.getOrNull()
+    }
+
+    private fun renderSuggestedFixesSection(bundle: VulnerabilityDetailsBundle) {
+        fixesSectionBody.removeAll()
+
+        val timelines = bundle.vulnerableTimelines
+        val fixes = bundle.rootFixes?.fixes.orEmpty()
+
+        fixes.entries.forEachIndexed { index, (dependencyKey, targetVersion) ->
+            val timeline = timelines.firstOrNull { timelineMatchesFix(it, dependencyKey) }
+            fixesSectionBody.add(createFixCard(dependencyKey, targetVersion, timeline))
+            if (index < fixes.size - 1 || bundle.rootFixes?.commands?.isNotEmpty() == true) {
+                fixesSectionBody.add(Box.createVerticalStrut(8))
+            }
+        }
+
+        bundle.rootFixes?.commands
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { commands ->
+                fixesSectionBody.add(createCardPanel().apply {
+                    add(JBLabel("Suggested commands").apply {
+                        font = font.deriveFont(Font.BOLD, 12f)
+                        alignmentX = LEFT_ALIGNMENT
+                    })
+                    add(Box.createVerticalStrut(6))
+                    commands.forEachIndexed { index, command ->
+                        add(createWrappedInfoArea(command, monospace = true))
+                        if (index < commands.lastIndex) {
+                            add(Box.createVerticalStrut(4))
+                        }
+                    }
+                })
+            }
+
+        if (fixes.isEmpty()) {
+            timelines.forEachIndexed { index, timeline ->
+                fixesSectionBody.add(createTimelineOnlyCard(timeline))
+                if (index < timelines.lastIndex) {
+                    fixesSectionBody.add(Box.createVerticalStrut(8))
+                }
+            }
+        }
+    }
+
+    private fun renderReferencesSection(references: List<VulnerabilityReferenceLink>) {
+        referencesSectionBody.removeAll()
+        renderedReferences = references
+        if (references.isEmpty()) return
+
+        val columns = calculateReferenceColumnCount()
+        renderedReferenceColumns = columns
+        val gridPanel = JPanel(GridBagLayout()).apply {
+            isOpaque = false
+            alignmentX = LEFT_ALIGNMENT
+        }
+        references.forEachIndexed { index, reference ->
+            gridPanel.add(createReferenceCard(reference, columns), GridBagConstraints().apply {
+                gridx = index % columns
+                gridy = index / columns
+                weightx = 1.0
+                fill = GridBagConstraints.HORIZONTAL
+                anchor = GridBagConstraints.NORTHWEST
+                insets = Insets(0, 0, JBUI.scale(12), JBUI.scale(12))
+            })
+        }
+        gridPanel.add(JPanel().apply { isOpaque = false }, GridBagConstraints().apply {
+            gridx = 0
+            gridy = (references.size + columns - 1) / columns
+            gridwidth = columns
+            weightx = 1.0
+            weighty = 1.0
+            fill = GridBagConstraints.BOTH
+        })
+        referencesSectionBody.add(gridPanel)
+    }
+
+    private fun rerenderReferencesIfNeeded() {
+        if (renderedReferences.isEmpty()) return
+        val columns = calculateReferenceColumnCount()
+        if (columns != renderedReferenceColumns) {
+            renderReferencesSection(renderedReferences)
+            referencesSectionBody.revalidate()
+            referencesSectionBody.repaint()
+        }
+    }
+
+    private fun calculateReferenceColumnCount(): Int {
+        val availableWidth = referencesSectionBody.width
+            .takeIf { it > 0 }
+            ?: (referencesSectionBody.parent?.width ?: width)
+        return when {
+            availableWidth >= JBUI.scale(1080) -> 3
+            availableWidth >= JBUI.scale(720) -> 2
+            else -> 1
+        }
+    }
+
+    private fun createReferenceCard(reference: VulnerabilityReferenceLink, columns: Int): JPanel = createCardPanel().apply {
+        alignmentY = TOP_ALIGNMENT
+        val linkButton = createLinkButton("↗", reference.link).apply {
+            font = font.deriveFont(Font.BOLD, 16f)
+            toolTipText = reference.link
+        }
+        add(JPanel(BorderLayout(JBUI.scale(8), 0)).apply {
+            isOpaque = false
+            alignmentX = LEFT_ALIGNMENT
+            add(createExternalReferenceTitle(reference, columns), BorderLayout.CENTER)
+            add(JPanel(BorderLayout()).apply {
+                isOpaque = false
+                add(linkButton, BorderLayout.NORTH)
+            }, BorderLayout.EAST)
+        })
+
+        val badges = buildReferenceBadges(reference)
+        if (badges.isNotEmpty()) {
+            add(Box.createVerticalStrut(10))
+            add(JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(6), 0)).apply {
+                isOpaque = false
+                alignmentX = LEFT_ALIGNMENT
+                badges.forEach { add(it) }
+            })
+        }
+    }
+
+    private fun createExternalReferenceTitle(reference: VulnerabilityReferenceLink, columns: Int): JComponent {
+        val rawTitle = reference.title.ifBlank { reference.link }
+        val previewTitle = previewReferenceTitle(rawTitle, columns)
+        val wrapWidthPx = when (columns) {
+            1 -> JBUI.scale(560)
+            2 -> JBUI.scale(300)
+            else -> JBUI.scale(210)
+        }
+        val titleLabel = JBLabel("<html><div style='width:${wrapWidthPx}px;'>${htmlEscape(previewTitle)}</div></html>").apply {
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            alignmentX = LEFT_ALIGNMENT
+            verticalAlignment = SwingConstants.TOP
+            toolTipText = "<html>${htmlEscape(rawTitle)}<br/><span style='color:gray'>${htmlEscape(reference.link)}</span></html>"
+        }
+        titleLabel.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(event: MouseEvent) {
+                BrowserUtil.browse(reference.link)
+            }
+        })
+        return titleLabel
+    }
+
+    private fun previewReferenceTitle(title: String, columns: Int): String {
+        val normalized = title.replace(Regex("\\s+"), " ").trim()
+        val maxLength = when (columns) {
+            1 -> 180
+            2 -> 100
+            else -> 68
+        }
+        return if (normalized.length <= maxLength) {
+            normalized
+        } else {
+            "${normalized.take(maxLength).trimEnd(' ', '.', ',', ';', ':')}…"
+        }
+    }
+
+    private fun buildReferenceBadges(reference: VulnerabilityReferenceLink): List<JComponent> {
+        val badges = mutableListOf<JComponent>()
+        reference.tags.forEach { tag ->
+            if (tag.isBlank()) return@forEach
+            badges += createPill(
+                tag,
+                JBColor(0x7B2CBF, 0x5E3B8C),
+                JBColor.WHITE
+            )
+        }
+        reference.domain
+            ?.takeIf { it.isNotBlank() }
+            ?.let {
+                badges += createPill(
+                    it,
+                    JBColor(0xF2F4F7, 0x32363F),
+                    JBColor(0x667085, 0xD0D5DD)
+                )
+            }
+        return badges
+    }
+
+    private fun timelineMatchesFix(timeline: VulnerabilityTimeline, dependencyKey: String): Boolean {
+        val (dependencyName, _) = parseRootFixKey(dependencyKey)
+        val normalizedFix = dependencyName.lowercase()
+        return timeline.dependencies.any { dependency ->
+            val candidates = listOfNotNull(dependency.name, dependency.shortName)
+                .map { it.substringBefore(" (").lowercase() }
+            candidates.any { it == normalizedFix || normalizedFix.endsWith(it) || it.endsWith(normalizedFix.substringAfterLast(':')) }
+        }
+    }
+
+    private fun createFixCard(
+        dependencyKey: String,
+        targetVersion: String,
+        timeline: VulnerabilityTimeline?
+    ): JPanel {
+        val (dependencyName, currentVersion) = parseRootFixKey(dependencyKey)
+        val dependencyLink = timeline?.dependencies?.firstOrNull()?.link
+        val ecosystem = timeline?.dependencies?.firstNotNullOfOrNull { dependency ->
+            extractDependencyEcosystem(dependency.shortName ?: dependency.name)
+        }
+        return createCardPanel().apply {
+            add(createDependencyHeader(dependencyName, ecosystem, dependencyLink))
+            add(Box.createVerticalStrut(6))
+            add(createVersionComparisonPanel(currentVersion, targetVersion))
+
+            timeline?.let {
+                add(Box.createVerticalStrut(8))
+                add(createTimelineIntervalsPanel(it))
+            }
+        }
+    }
+
+    private fun createTimelineOnlyCard(timeline: VulnerabilityTimeline): JPanel = createCardPanel().apply {
+        val dependency = timeline.dependencies.firstOrNull()
+        val dependencyTitle = dependency?.shortName?.let { stripDependencyEcosystem(it) }
+            ?: dependency?.name?.let { stripDependencyEcosystem(it) }
+            ?: "Dependency"
+        val dependencyLink = dependency?.link
+        val ecosystem = dependency?.let {
+            extractDependencyEcosystem(it.shortName ?: it.name)
+        }
+        add(createDependencyHeader(dependencyTitle, ecosystem, dependencyLink))
+        dependency?.name
+            ?.takeIf { it.isNotBlank() && stripDependencyEcosystem(it) != dependencyTitle }
+            ?.let {
+                add(Box.createVerticalStrut(4))
+                add(createWrappedInfoArea(it, foreground = JBColor.GRAY))
+            }
+        add(Box.createVerticalStrut(8))
+        add(createTimelineIntervalsPanel(timeline))
+    }
+
+    private fun createDependencyHeader(dependencyName: String, ecosystem: String?, dependencyLink: String?): JPanel = JPanel(BorderLayout(JBUI.scale(8), 0)).apply {
+        isOpaque = false
+        alignmentX = LEFT_ALIGNMENT
+        add(
+            dependencyLink?.takeIf { it.isNotBlank() }
+                ?.let { createLinkArea(dependencyName, it, bold = true) }
+                ?: createWrappedInfoArea(dependencyName, bold = true),
+            BorderLayout.CENTER
+        )
+        ecosystem?.takeIf { it.isNotBlank() }?.let {
+            add(createPill(it, JBColor(0xE8EEF9, 0x2F3B52), JBColor(0x274472, 0xD7E6FF)), BorderLayout.EAST)
+        }
+    }
+
+    private fun createVersionComparisonPanel(currentVersion: String?, targetVersion: String): JPanel = JPanel().apply {
+        layout = GridLayout(1, if (currentVersion.isNullOrBlank()) 1 else 2, JBUI.scale(8), 0)
+        isOpaque = false
+        alignmentX = LEFT_ALIGNMENT
+        currentVersion?.takeIf { it.isNotBlank() }?.let {
+            add(createVersionStagePanel("Current", it, JBColor(0xFDECEC, 0x4E2B2B), JBColor(0xA62C2C, 0xFFD9D9)))
+        }
+        add(createVersionStagePanel("Recommended", targetVersion, JBColor(0xE8F6EA, 0x1F4A2D), JBColor(0x227A3E, 0xDBFFE5)))
+    }
+
+    private fun createVersionStagePanel(label: String, version: String, background: JBColor, foreground: JBColor): JPanel = JPanel().apply {
+        layout = BoxLayout(this, BoxLayout.Y_AXIS)
+        isOpaque = false
+        border = JBUI.Borders.compound(
+            JBUI.Borders.customLine(JBColor.border()),
+            JBUI.Borders.empty(8)
+        )
+        add(JBLabel(label).apply {
+            this.foreground = JBColor.GRAY
+            font = font.deriveFont(Font.BOLD, 11f)
+            alignmentX = LEFT_ALIGNMENT
+        })
+        add(Box.createVerticalStrut(6))
+        add(createPill(version, background, foreground).apply {
+            alignmentX = LEFT_ALIGNMENT
+        })
+    }
+
+    private fun extractDependencyEcosystem(text: String?): String? {
+        if (text.isNullOrBlank()) return null
+        val trimmed = text.trim()
+        val start = trimmed.lastIndexOf('(')
+        val end = trimmed.lastIndexOf(')')
+        if (start < 0 || end <= start) return null
+        return trimmed.substring(start + 1, end).trim().takeIf { it.isNotBlank() }
+    }
+
+    private fun stripDependencyEcosystem(text: String): String {
+        val ecosystem = extractDependencyEcosystem(text) ?: return text
+        return text.removeSuffix("($ecosystem)").trim().removeSuffix("(").trim()
+    }
+
+    private fun createTimelineIntervalsPanel(timeline: VulnerabilityTimeline): JPanel = JPanel().apply {
+        layout = BoxLayout(this, BoxLayout.Y_AXIS)
+        isOpaque = false
+        alignmentX = LEFT_ALIGNMENT
+        add(JBLabel("Version timeline").apply {
+            foreground = JBColor.GRAY
+            font = font.deriveFont(Font.BOLD, 11f)
+            alignmentX = LEFT_ALIGNMENT
+        })
+        add(Box.createVerticalStrut(6))
+        timeline.intervals.forEachIndexed { index, interval ->
+            add(createTimelineIntervalRow(interval))
+            if (index < timeline.intervals.lastIndex) {
+                add(Box.createVerticalStrut(4))
+            }
+        }
+    }
+
+    private fun createTimelineIntervalRow(interval: com.debricked.intellijplugin.domain.VulnerabilityTimelineInterval): JPanel = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(8), 0)).apply {
+        isOpaque = false
+        alignmentX = LEFT_ALIGNMENT
+        val background = if (interval.vulnerable) JBColor(0xF8D7DA, 0x5C2B31) else JBColor(0xDFF3E4, 0x234A31)
+        val pillForeground = if (interval.vulnerable) JBColor(0xB71C1C, 0xFFD7D7) else JBColor(0x1B5E20, 0xD8F5DC)
+        add(createPill(formatTimelineRange(interval.startVersion, interval.endVersion), background, pillForeground))
+        add(JBLabel(if (interval.vulnerable) "Vulnerable" else "Safe").apply {
+            foreground = JBColor.GRAY
+        })
+    }
+
+    private fun createAdvisoryCard(sourceName: String): AdvisoryCard {
+        val subtitleLabel = createAdvisoryTitleArea()
         val bodyArea = createDetailsArea().apply {
             font = font.deriveFont(Font.PLAIN, 11f)
         }
@@ -2001,12 +2644,35 @@ private class VulnerabilityDetailsPanel(
             }
         }
         
+        // Row 1: Score values
         scoreLabels[0].text = cvss["CVSS4"]?.scoreText ?: "N/A"
         scoreLabels[1].text = cvss["CVSS3"]?.scoreText ?: "N/A"
         scoreLabels[2].text = cvss["CVSS2"]?.scoreText ?: "N/A"
+        
+        // Row 2: Version labels
         scoreLabels[3].text = "CVSS4"
         scoreLabels[4].text = "CVSS3"
         scoreLabels[5].text = "CVSS2"
+        
+        // Row 3: Severity labels
+        scoreLabels[6].text = cvss["CVSS4"]?.label ?: ""
+        scoreLabels[7].text = cvss["CVSS3"]?.label ?: ""
+        scoreLabels[8].text = cvss["CVSS2"]?.label ?: ""
+        
+        // Style CVSS4 box if score exists
+        val cvss4Score = cvss["CVSS4"]?.scoreText
+        if (cvss4Score != null && cvss4Score != "N/A") {
+            scoreBoxPanel.apply {
+                background = JBColor(0x1e3a5f, 0x2d5a8a)
+                border = null
+                isOpaque = true
+            }
+            scoreLabels[0].foreground = JBColor(Color.WHITE, Color.WHITE)
+
+        } else {
+            scoreBoxPanel.isOpaque = false
+            scoreLabels[0].foreground = JBColor.foreground()
+        }
         
         return ""
     }
@@ -2024,12 +2690,19 @@ private class VulnerabilityDetailsPanel(
         cweCard.expanded = false
         cweCard.linkTarget = source?.link?.takeIf { it.isNotBlank() }
         val title = source?.title?.takeIf { it.isNotBlank() } ?: "CWE"
-        cweCard.subtitleLabel.text = title
-        cweCard.linkLabel.text = "View reference"
-        cweCard.linkLabel.isEnabled = cweCard.linkTarget != null
-        cweCard.linkLabel.isVisible = cweCard.linkTarget != null
-        cweCard.moreDetailsButton.isEnabled = cweCard.fullText.length > ADVISORY_PREVIEW_LENGTH
-        cweCard.moreDetailsButton.text = if (cweCard.moreDetailsButton.isEnabled) "More details" else ""
+        val titleWithIcon = if (cweCard.linkTarget != null) "$title 🔗" else title
+        cweCard.subtitleLabel.text = titleWithIcon
+        cweCard.subtitleLabel.foreground = if (cweCard.linkTarget != null) JBColor.BLUE else JBColor.foreground()
+        cweCard.subtitleLabel.cursor = Cursor.getPredefinedCursor(
+            if (cweCard.linkTarget != null) Cursor.HAND_CURSOR else Cursor.DEFAULT_CURSOR
+        )
+        cweCard.subtitleLabel.mouseListeners.forEach { cweCard.subtitleLabel.removeMouseListener(it) }
+        cweCard.subtitleLabel.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(event: MouseEvent) {
+                cweCard.linkTarget?.let { BrowserUtil.browse(it) }
+            }
+        })
+        cweCard.linkLabel.isVisible = false
         updateAdvisoryCardBody(cweCard)
     }
 
@@ -2040,11 +2713,17 @@ private class VulnerabilityDetailsPanel(
         val title = source?.title?.takeIf { it.isNotBlank() } ?: "${card.sourceName} advisory"
         val titleWithIcon = if (card.linkTarget != null) "$title 🔗" else title
         card.subtitleLabel.text = titleWithIcon
-        card.linkLabel.text = "View on ${card.sourceName}"
-        card.linkLabel.isEnabled = card.linkTarget != null
-        card.linkLabel.isVisible = card.linkTarget != null
-        card.moreDetailsButton.isEnabled = card.fullText.length > ADVISORY_PREVIEW_LENGTH
-        card.moreDetailsButton.text = if (card.moreDetailsButton.isEnabled) "More details" else ""
+        card.subtitleLabel.foreground = if (card.linkTarget != null) JBColor.BLUE else JBColor.foreground()
+        card.subtitleLabel.cursor = Cursor.getPredefinedCursor(
+            if (card.linkTarget != null) Cursor.HAND_CURSOR else Cursor.DEFAULT_CURSOR
+        )
+        card.subtitleLabel.mouseListeners.forEach { card.subtitleLabel.removeMouseListener(it) }
+        card.subtitleLabel.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(event: MouseEvent) {
+                card.linkTarget?.let { BrowserUtil.browse(it) }
+            }
+        })
+        card.linkLabel.isVisible = false
         updateAdvisoryCardBody(card)
     }
 
@@ -2054,20 +2733,22 @@ private class VulnerabilityDetailsPanel(
         updateAdvisoryCardBody(card)
         card.panel.revalidate()
         card.panel.repaint()
-        scrollToTop()
     }
 
     private fun updateAdvisoryCardBody(card: AdvisoryCard) {
         val text = card.fullText.ifBlank { "No summary available." }
+        val hasExpandableDetails = text.length > ADVISORY_PREVIEW_LENGTH
         card.bodyArea.text = if (card.expanded || text.length <= ADVISORY_PREVIEW_LENGTH) {
             text
         } else {
             "${text.take(ADVISORY_PREVIEW_LENGTH).trimEnd()}..."
         }
-        card.moreDetailsButton.text = if (card.moreDetailsButton.isEnabled) {
+        card.moreDetailsButton.isEnabled = hasExpandableDetails
+        card.moreDetailsButton.isVisible = hasExpandableDetails
+        card.moreDetailsButton.text = if (hasExpandableDetails) {
             if (card.expanded) "Less details" else "More details"
         } else {
-            "Details unavailable"
+            ""
         }
         card.panel.revalidate()
         card.panel.repaint()
@@ -2105,56 +2786,85 @@ private class VulnerabilityDetailsPanel(
         return node.children.flatMap { flattenDependencyPaths(it, path) }
     }
 
-    private fun buildRootFixText(rootFixes: VulnerabilityRootFixes?): String {
-        if (rootFixes == null) return ""
-        val fixes = rootFixes.fixes.entries.joinToString("\n") { "${it.key} -> ${it.value}" }
-        val commands = rootFixes.commands.joinToString("\n")
-        return listOf(
-            if (rootFixes.rootFixesCount > 0) "Root fixes found: ${rootFixes.rootFixesCount}" else "",
-            fixes,
-            commands
-        ).filter { it.isNotBlank() }.joinToString("\n\n")
+    private fun buildRootFixText(
+        rootFixes: VulnerabilityRootFixes?,
+        vulnerableTimelines: List<VulnerabilityTimeline>
+    ): String {
+        val sections = mutableListOf<String>()
+
+        rootFixes?.let { fixes ->
+            val fixLines = fixes.fixes.entries.joinToString("\n") { (dependencyKey, targetVersion) ->
+                val (dependencyName, currentVersion) = parseRootFixKey(dependencyKey)
+                val currentVersionText = currentVersion?.takeIf { it.isNotBlank() }?.let { " from $it" }.orEmpty()
+                "• Update $dependencyName$currentVersionText to $targetVersion"
+            }
+            val commandLines = fixes.commands.joinToString("\n") { "• $it" }
+            sections += listOf(
+                if (fixes.rootFixesCount > 0) "Direct dependencies to update: ${fixes.rootFixesCount}" else "",
+                fixLines,
+                if (commandLines.isNotBlank()) "Suggested commands:\n$commandLines" else "",
+                if (!fixes.isReady && fixes.fixes.isEmpty() && fixes.commands.isEmpty()) "Fix suggestions are not ready yet." else ""
+            ).filter { it.isNotBlank() }.joinToString("\n")
+        }
+
+        buildVulnerableTimelineText(vulnerableTimelines)
+            .takeIf { it.isNotBlank() }
+            ?.let { sections += it }
+
+        return sections.filter { it.isNotBlank() }.joinToString("\n\n")
+    }
+
+    private fun parseRootFixKey(key: String): Pair<String, String?> {
+        val parts = key.split("#", limit = 2)
+        return parts.first() to parts.getOrNull(1)
+    }
+
+    private fun buildVulnerableTimelineText(vulnerableTimelines: List<VulnerabilityTimeline>): String {
+        if (vulnerableTimelines.isEmpty()) return ""
+        val entries = vulnerableTimelines.mapNotNull { timeline ->
+            val dependency = timeline.dependencies.firstOrNull() ?: return@mapNotNull null
+            val dependencyLabel = dependency.shortName?.takeIf { it.isNotBlank() } ?: dependency.name
+            val vulnerableRanges = timeline.intervals
+                .filter { it.vulnerable }
+                .joinToString(", ") { interval -> formatTimelineRange(interval.startVersion, interval.endVersion) }
+                .ifBlank { "Not reported" }
+            buildString {
+                append("• $dependencyLabel")
+                if (dependency.shortName?.takeIf { it.isNotBlank() } != null && dependency.shortName != dependency.name) {
+                    append("\n  Package: ${dependency.name}")
+                }
+                append("\n  Vulnerable versions: $vulnerableRanges")
+            }
+        }
+        if (entries.isEmpty()) return ""
+        return "Vulnerable dependency timeline:\n${entries.joinToString("\n")}"
+    }
+
+    private fun formatTimelineRange(startVersion: String?, endVersion: String?): String {
+        val start = startVersion
+            ?.takeIf { it.isNotBlank() }
+            ?.takeUnless { it.equals("zero", ignoreCase = true) }
+        val end = endVersion
+            ?.takeIf { it.isNotBlank() }
+            ?.takeUnless { it.equals("inf", ignoreCase = true) }
+        return when {
+            start != null && end != null -> "$start - $end"
+            start == null && end != null -> "up to $end"
+            start != null && end == null -> "$start and later"
+            else -> "All versions"
+        }
+    }
+
+    private fun scrollToSection(component: JComponent) {
+        SwingUtilities.invokeLater {
+            val scrollPane = SwingUtilities.getAncestorOfClass(JScrollPane::class.java, this) as? JScrollPane ?: return@invokeLater
+            val point = SwingUtilities.convertPoint(component.parent, component.location, scrollPane.viewport.view)
+            scrollPane.viewport.viewPosition = Point(0, point.y.coerceAtLeast(0))
+        }
     }
 
     private fun buildReferencesText(references: List<VulnerabilityReferenceLink>): String =
         references.joinToString("\n") { "${it.title} - ${it.link}" }
-
-    private fun buildReachabilityText(
-        finding: VulnerabilityFinding,
-        bundle: VulnerabilityDetailsBundle
-    ): String {
-        val lines = mutableListOf<String>()
-        lines += "List result: ${finding.reachablePath ?: "Unknown"}"
-        finding.reachabilityMessage?.takeIf { it.isNotBlank() }?.let { lines += "Message: $it" }
-        bundle.reachabilityDetails?.let { details ->
-            if (!details.supported) {
-                lines += "Detailed reachability analysis is not available for this account or repository."
-            } else {
-                details.reachAnalysis?.let { lines += "Analysis score: $it" }
-                details.reachAnalysisLanguage?.let { lines += "Language: $it" }
-                details.reachAnalysisMessage?.takeIf { it.isNotBlank() }?.let { lines += "Detail: $it" }
-            }
-        }
-        return lines.joinToString("\n")
-    }
-
-    private fun buildReviewMetaText(
-        context: VulnerabilityDetailsContext,
-        finding: VulnerabilityFinding,
-        bundle: VulnerabilityDetailsBundle
-    ): String {
-        val repoStatus = bundle.repositoryStatuses.firstOrNull { it.id == context.repositoryId }
-        val lines = mutableListOf<String>()
-        lines += "Current status: ${repoStatus?.type ?: finding.reviewStatusDisplay()}"
-        repoStatus?.pausedUntil?.takeIf { it.isNotBlank() }?.let { lines += "Paused until: $it" }
-        bundle.reviewStatusInfo?.let { info ->
-            lines += "Comment required: ${if (info.enforceComment) "Yes" else "No"}"
-            info.commentMinLength?.takeIf { it > 0 }?.let { lines += "Minimum comment length: $it" }
-            info.oldComment?.takeIf { it.isNotBlank() }?.let { lines += "Previous comment: $it" }
-            info.oldCommentAuthor?.takeIf { it.isNotBlank() }?.let { lines += "Comment author: $it" }
-        }
-        return lines.joinToString("\n")
-    }
 
     private fun resolveDisplayedReviewStatus(
         context: VulnerabilityDetailsContext,
@@ -2189,6 +2899,15 @@ private class VulnerabilityDetailsPanel(
         return "$appBase/app/en/vulnerability/${URLEncoder.encode(vulnerabilityId, "UTF-8")}?commitId=${URLEncoder.encode(commitId, "UTF-8")}"
     }
 
+    private fun buildDependencyInlineChipText(dependencyName: String): String {
+        val trimmedDependencyName = dependencyName.trim()
+        return if (trimmedDependencyName.length <= 54) {
+            trimmedDependencyName
+        } else {
+            "${trimmedDependencyName.take(51).trimEnd()}..."
+        }
+    }
+
     private fun htmlText(text: String): String = "<html>${text.replace("\n", "<br/>")}</html>"
 
     private fun htmlEscape(text: String): String = text
@@ -2197,172 +2916,383 @@ private class VulnerabilityDetailsPanel(
         .replace(">", "&gt;")
 }
 
-private class CvssRenderer : DefaultTableCellRenderer() {
-    private val df = DecimalFormat("0.0")
+// ════════════════════════��═════════════════════════════════════════════════════
+// Dependencies Tab
+// ══════════════════════════════════════════════════════════════════════════════
 
-    override fun getTableCellRendererComponent(
-        table: JTable?,
-        value: Any?,
-        isSelected: Boolean,
-        hasFocus: Boolean,
-        row: Int,
-        column: Int
-    ): Component {
-        val c = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column)
-        if (table != null && (table.model as? VulnerabilityTableModel)?.isGroupHeader(row) == true) {
-            text = ""
-            icon = null
-            foreground = if (isSelected) table.selectionForeground else JBColor.GRAY
-            font = font.deriveFont(Font.BOLD)
-            return c
-        }
+class DependenciesTabProvider(
+    private val panel: DependenciesTabPanel
+) : TabProvider {
+    override val tabTitle: String = "Dependencies"
+    override fun getPanel(): JComponent = panel
 
-        val finding = (table?.model as? VulnerabilityTableModel)?.getFindingAt(row)
-        val score = (value as? Number)?.toDouble()
-        text = score?.let { df.format(it) } ?: "-"
-        foreground = scoreColor(score)
-        horizontalAlignment = SwingConstants.LEFT
-        horizontalTextPosition = SwingConstants.LEFT
-        iconTextGap = JBUI.scale(6)
-        icon = finding
-            ?.takeIf { it.cvss3Score != null }
-            ?.displaySeverity()
-            ?.takeIf { it != Severity.UNKNOWN }
-            ?.let { SeverityShieldIcon(it) }
-        font = font.deriveFont(Font.PLAIN)
-        return c
+    override fun loadData(context: TabContext, forceRefresh: Boolean) {
+        if (context.repositoryId.isBlank()) return
+        panel.requestLoad(context.repositoryId, context.branchId, forceRefresh)
     }
 
-    private fun scoreColor(score: Double?): Color = when {
-        score == null -> JBColor.GRAY
-        score >= 9.0 -> JBColor(Color(170, 30, 30), Color(255, 120, 120))
-        score >= 7.0 -> JBColor(Color(190, 100, 0), Color(255, 170, 90))
-        score >= 4.0 -> JBColor(Color(160, 130, 0), Color(230, 210, 90))
-        score > 0.0 -> JBColor(Color(0, 110, 190), Color(120, 180, 255))
-        else -> JBColor.GRAY
+    override fun invalidate(context: TabContext) {
+        panel.invalidateCache()
     }
 }
 
-private class SeverityShieldIcon(private val severity: Severity) : Icon {
-    override fun getIconWidth(): Int = JBUI.scale(15)
+class DependenciesTabPanel(private val project: Project) : JPanel(BorderLayout()) {
 
-    override fun getIconHeight(): Int = JBUI.scale(16)
+    private val apiClient = ApplicationManager.getApplication().getService(DebrickedApiClient::class.java)
+    private val cache = DependencyCache()
 
-    override fun paintIcon(c: Component?, g: Graphics, x: Int, y: Int) {
-        val g2 = g.create() as Graphics2D
-        try {
-            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
-            g2.translate(x.toDouble(), y.toDouble())
-            g2.color = backgroundColor(severity)
-            g2.fill(buildShieldPath(iconWidth.toDouble(), iconHeight.toDouble()))
+    private val model = DependencyTableModel()
+    private val table = JBTable(model).apply {
+        setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
+        fillsViewportHeight = true
+        rowHeight = 24
+        autoCreateRowSorter = true
+    }
+    private val detailsPanel = DependencyDetailsPanel()
+    private val statusLabel = JBLabel("").apply { foreground = JBColor.GRAY }
+    private val countLabel = JBLabel("").apply { foreground = JBColor.GRAY }
+    private val pageLabel = JBLabel("Page 1").apply { foreground = JBColor.GRAY }
+    private val previousPageButton = JButton("Prev")
+    private val nextPageButton = JButton("Next")
+    private val pageSizeCombo = ComboBox(arrayOf(15, 25, 50, 100)).apply {
+        selectedItem = 25
+        toolTipText = "Rows per page"
+    }
+    private val searchField = SearchTextField(false).apply {
+        textEditor.emptyText.text = "Search by package name"
+        preferredSize = JBUI.size(360, preferredSize.height)
+        minimumSize = JBUI.size(260, minimumSize.height)
+    }
+    private val searchDebounceTimer = javax.swing.Timer(250) {
+        currentPage = 1
+        triggerLoad(forceRefresh = false)
+    }.apply { isRepeats = false }
 
-            g2.color = JBColor.WHITE
-            val baseFont = c?.font ?: Font(Font.SANS_SERIF, Font.BOLD, 12)
-            g2.font = baseFont.deriveFont(Font.BOLD, JBUI.scale(9).toFloat())
-            val letter = severityLetter(severity)
-            val metrics = g2.fontMetrics
-            val textX = (iconWidth - metrics.stringWidth(letter)) / 2
-            val textY = ((iconHeight - metrics.height) / 2) + metrics.ascent - JBUI.scale(1)
-            g2.drawString(letter, textX, textY)
-        } finally {
-            g2.dispose()
+    private val refreshAction = object : AnAction("Refresh", "Refresh dependency list", AllIcons.Actions.Refresh) {
+        override fun actionPerformed(e: AnActionEvent) { triggerLoad(forceRefresh = true) }
+        override fun displayTextInToolbar(): Boolean = false
+        override fun update(e: AnActionEvent) {
+            e.presentation.text = "Refresh dependencies"
+            e.presentation.icon = AllIcons.Actions.Refresh
+            e.presentation.description = "Refresh dependency list"
+            e.presentation.isEnabled = true
         }
     }
+    private val sidebarToolbar = ActionManager.getInstance()
+        .createActionToolbar("DebrickedDependenciesSidebar", DefaultActionGroup(refreshAction), true)
 
-    private fun backgroundColor(severity: Severity): Color = when (severity) {
-        Severity.CRITICAL -> JBColor(Color(233, 53, 112), Color(255, 120, 170))
-        Severity.HIGH -> JBColor(Color(234, 97, 35), Color(255, 155, 102))
-        Severity.MEDIUM -> JBColor(Color(226, 171, 24), Color(247, 209, 102))
-        Severity.LOW -> JBColor(Color(58, 120, 221), Color(116, 175, 255))
-        Severity.UNKNOWN -> JBColor.GRAY
-    }
+    private var currentPage = 1
+    private var rowsPerPage = 25
+    private var hasNextPage = false
+    private var totalCount: Int? = null
+    private var currentRepositoryId: String = ""
+    private var currentBranchId: String? = null
+    private var loadRequestToken = 0
 
-    private fun severityLetter(severity: Severity): String = when (severity) {
-        Severity.CRITICAL -> "C"
-        Severity.HIGH -> "H"
-        Severity.MEDIUM -> "M"
-        Severity.LOW -> "L"
-        Severity.UNKNOWN -> "?"
-    }
-
-    private fun buildShieldPath(width: Double, height: Double): Path2D.Double = Path2D.Double().apply {
-        moveTo(width * 0.20, height * 0.10)
-        quadTo(width * 0.50, 0.0, width * 0.80, height * 0.10)
-        quadTo(width * 0.93, height * 0.15, width * 0.93, height * 0.31)
-        lineTo(width * 0.93, height * 0.57)
-        quadTo(width * 0.93, height * 0.77, width * 0.50, height)
-        quadTo(width * 0.07, height * 0.77, width * 0.07, height * 0.57)
-        lineTo(width * 0.07, height * 0.31)
-        quadTo(width * 0.07, height * 0.15, width * 0.20, height * 0.10)
-        closePath()
-    }
-}
-
-private class NameRenderer : DefaultTableCellRenderer() {
-    override fun getTableCellRendererComponent(
-        table: JTable?,
-        value: Any?,
-        isSelected: Boolean,
-        hasFocus: Boolean,
-        row: Int,
-        column: Int
-    ): Component {
-        val c = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column)
-        horizontalAlignment = SwingConstants.LEFT
-        if (table != null && (table.model as? VulnerabilityTableModel)?.isGroupHeader(row) == true) {
-            font = font.deriveFont(Font.BOLD)
-            foreground = if (isSelected) table.selectionForeground else JBColor.GRAY
-        } else {
-            font = font.deriveFont(Font.PLAIN)
-        }
-        return c
-    }
-}
-
-private class LeftAlignRenderer : DefaultTableCellRenderer() {
-    override fun getTableCellRendererComponent(
-        table: JTable?,
-        value: Any?,
-        isSelected: Boolean,
-        hasFocus: Boolean,
-        row: Int,
-        column: Int
-    ): Component {
-        val c = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column)
-        horizontalAlignment = SwingConstants.LEFT
-        if (table != null && (table.model as? VulnerabilityTableModel)?.isGroupHeader(row) == true) {
-            text = ""
-            foreground = if (isSelected) table.selectionForeground else JBColor.GRAY
-            font = font.deriveFont(Font.BOLD)
-        } else {
-            font = font.deriveFont(Font.PLAIN)
-        }
-        return c
-    }
-}
-
-private class PlaceholderTabPanel(
-    title: String,
-    description: String
-) : JPanel(GridBagLayout()) {
     init {
-        border = JBUI.Borders.empty(16)
-        add(JPanel().apply {
-            layout = BoxLayout(this, BoxLayout.Y_AXIS)
-            border = JBUI.Borders.compound(
-                JBUI.Borders.customLine(JBColor.border()),
-                JBUI.Borders.empty(20, 24)
-            )
-            maximumSize = Dimension(420, Int.MAX_VALUE)
-            add(JBLabel(title).apply {
-                font = font.deriveFont(Font.BOLD, 14f)
-                alignmentX = Component.CENTER_ALIGNMENT
-            })
-            add(Box.createVerticalStrut(8))
-            add(JBLabel(description).apply {
-                alignmentX = Component.CENTER_ALIGNMENT
-                foreground = JBColor.GRAY
-            })
+        border = JBUI.Borders.empty(8)
+
+        table.selectionModel.addListSelectionListener {
+            if (!it.valueIsAdjusting) {
+                val viewRow = table.selectedRow
+                if (viewRow >= 0) {
+                    val modelRow = table.convertRowIndexToModel(viewRow)
+                    detailsPanel.setItem(model.getItemAt(modelRow))
+                } else {
+                    detailsPanel.setItem(null)
+                }
+            }
+        }
+
+        searchField.addDocumentListener(object : DocumentListener {
+            override fun insertUpdate(e: DocumentEvent) = onSearchChanged()
+            override fun removeUpdate(e: DocumentEvent) = onSearchChanged()
+            override fun changedUpdate(e: DocumentEvent) = onSearchChanged()
         })
+
+        previousPageButton.addActionListener {
+            if (currentPage <= 1) return@addActionListener
+            currentPage -= 1
+            triggerLoad(forceRefresh = false)
+        }
+        nextPageButton.addActionListener {
+            if (!hasNextPage) return@addActionListener
+            currentPage += 1
+            triggerLoad(forceRefresh = false)
+        }
+        pageSizeCombo.addActionListener {
+            val selected = pageSizeCombo.selectedItem as? Int ?: return@addActionListener
+            if (selected == rowsPerPage) return@addActionListener
+            rowsPerPage = selected
+            currentPage = 1
+            triggerLoad(forceRefresh = false)
+        }
+
+        val searchBar = JPanel(GridBagLayout()).apply {
+            isOpaque = false
+            add(searchField, GridBagConstraints().apply {
+                gridx = 0; weightx = 0.0; fill = GridBagConstraints.HORIZONTAL
+                insets = Insets(0, 0, 0, 8)
+            })
+            add(statusLabel, GridBagConstraints().apply {
+                gridx = 1; weightx = 0.0; anchor = GridBagConstraints.WEST
+                insets = Insets(0, 0, 0, 8)
+            })
+            add(previousPageButton, GridBagConstraints().apply {
+                gridx = 2; weightx = 0.0; anchor = GridBagConstraints.WEST
+                insets = Insets(0, 0, 0, 6)
+            })
+            add(nextPageButton, GridBagConstraints().apply {
+                gridx = 3; weightx = 0.0; anchor = GridBagConstraints.WEST
+                insets = Insets(0, 0, 0, 6)
+            })
+            add(pageLabel, GridBagConstraints().apply {
+                gridx = 4; weightx = 0.0; anchor = GridBagConstraints.WEST
+                insets = Insets(0, 0, 0, 6)
+            })
+            add(pageSizeCombo, GridBagConstraints().apply {
+                gridx = 5; weightx = 0.0; anchor = GridBagConstraints.WEST
+                insets = Insets(0, 0, 0, 8)
+            })
+            add(JPanel().apply { isOpaque = false }, GridBagConstraints().apply {
+                gridx = 6; weightx = 1.0; fill = GridBagConstraints.HORIZONTAL
+            })
+            add(countLabel, GridBagConstraints().apply {
+                gridx = 7; anchor = GridBagConstraints.WEST
+            })
+        }
+
+        applyColumnRenderers()
+
+        sidebarToolbar.setTargetComponent(this)
+        sidebarToolbar.setOrientation(SwingConstants.VERTICAL)
+        sidebarToolbar.setMiniMode(true)
+        sidebarToolbar.setMinimumButtonSize(ActionToolbar.DEFAULT_MINIMUM_BUTTON_SIZE)
+        sidebarToolbar.component.isOpaque = false
+        sidebarToolbar.component.border = JBUI.Borders.empty()
+
+        val sidebarPanel = JPanel(BorderLayout()).apply {
+            isOpaque = false
+            border = JBUI.Borders.empty(4, 0, 0, 2)
+            add(sidebarToolbar.component, BorderLayout.NORTH)
+        }
+
+        val tablePane = JBScrollPane(table)
+        val detailsScrollPane = JBScrollPane(detailsPanel).apply {
+            horizontalScrollBarPolicy = JBScrollPane.HORIZONTAL_SCROLLBAR_NEVER
+            border = JBUI.Borders.empty()
+        }
+        val mainSplitPane = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, tablePane, detailsScrollPane).apply {
+            resizeWeight = 0.5
+            border = JBUI.Borders.emptyTop(8)
+        }
+
+        add(searchBar, BorderLayout.NORTH)
+        add(JPanel(BorderLayout()).apply {
+            isOpaque = false
+            add(sidebarPanel, BorderLayout.WEST)
+            add(mainSplitPane, BorderLayout.CENTER)
+        }, BorderLayout.CENTER)
+        SwingUtilities.invokeLater { mainSplitPane.setDividerLocation(0.5) }
+        table.emptyText.text = "Select a repository and branch to load dependencies"
+        updatePaginationControls()
+    }
+
+    private fun applyColumnRenderers() {
+        table.createDefaultColumnsFromModel()
+        // Vulnerabilities count: right-align
+        val vulnCol = table.columnModel.getColumn(DependencyColumns.VULNERABILITIES)
+        vulnCol.cellRenderer = object : DefaultTableCellRenderer() {
+            init { horizontalAlignment = SwingConstants.RIGHT }
+            override fun getTableCellRendererComponent(t: JTable, v: Any?, sel: Boolean, foc: Boolean, row: Int, col: Int): java.awt.Component {
+                super.getTableCellRendererComponent(t, v, sel, foc, row, col)
+                val count = v as? Int ?: 0
+                text = if (count > 0) count.toString() else "-"
+                foreground = when {
+                    count > 0 -> JBColor(0xD32F2F, 0xFF7070)
+                    else -> JBColor.GRAY
+                }
+                return this
+            }
+        }
+    }
+
+    fun requestLoad(repositoryId: String, branchId: String?, forceRefresh: Boolean) {
+        if (repositoryId.isBlank()) return
+        val contextChanged = repositoryId != currentRepositoryId || branchId != currentBranchId
+        if (contextChanged) {
+            currentRepositoryId = repositoryId
+            currentBranchId = branchId
+            currentPage = 1
+        }
+        triggerLoad(forceRefresh = forceRefresh || contextChanged)
+    }
+
+    fun invalidateCache() {
+        if (currentRepositoryId.isNotBlank()) {
+            cache.invalidate(currentRepositoryId, currentBranchId)
+        }
+    }
+
+    private fun onSearchChanged() {
+        searchDebounceTimer.restart()
+    }
+
+    private fun triggerLoad(forceRefresh: Boolean) {
+        if (currentRepositoryId.isBlank()) return
+        val repositoryId = currentRepositoryId
+        val branchId = currentBranchId
+        val query = DependencyQuery(
+            search = searchField.text.trim(),
+            page = currentPage,
+            rowsPerPage = rowsPerPage,
+            sortColumn = "name",
+            order = "asc"
+        )
+        val queryKey = buildQueryKey(query)
+
+        statusLabel.text = "Loading..."
+        statusLabel.isVisible = true
+        table.emptyText.text = "Loading dependencies..."
+        previousPageButton.isEnabled = false
+        nextPageButton.isEnabled = false
+        val requestToken = ++loadRequestToken
+
+        ApplicationManager.getApplication().executeOnPooledThread {
+            try {
+                val pageResult = cache.getOrLoad(repositoryId, branchId, queryKey, forceRefresh) {
+                    apiClient.getDependenciesPage(repositoryId, branchId, query)
+                }
+                ApplicationManager.getApplication().invokeLater({
+                    if (requestToken != loadRequestToken) return@invokeLater
+                    applyPageResult(pageResult)
+                }, ModalityState.any())
+            } catch (e: Exception) {
+                ApplicationManager.getApplication().invokeLater({
+                    if (requestToken != loadRequestToken) return@invokeLater
+                    model.setItems(emptyList())
+                    table.emptyText.text = "Failed to load dependencies: ${e.message ?: "Unknown error"}"
+                    statusLabel.text = ""
+                    statusLabel.isVisible = false
+                    updatePaginationControls()
+                    detailsPanel.setItem(null)
+                }, ModalityState.any())
+            }
+        }
+    }
+
+    private fun applyPageResult(pageResult: DependencyPageResult) {
+        currentPage = pageResult.page.coerceAtLeast(1)
+        rowsPerPage = pageResult.rowsPerPage.coerceAtLeast(1)
+        hasNextPage = pageResult.hasNext
+        totalCount = pageResult.totalCount
+        model.setItems(pageResult.dependencies)
+        if (pageResult.dependencies.isEmpty()) {
+            table.emptyText.text = if (searchField.text.isBlank()) "No dependencies found" else "No dependencies match your search"
+        }
+        statusLabel.text = ""
+        statusLabel.isVisible = false
+        updatePaginationControls()
+        sidebarToolbar.updateActionsImmediately()
+    }
+
+    private fun updatePaginationControls() {
+        val visibleCount = model.visibleCount()
+        val knownTotal = totalCount
+        val pageStart = if (visibleCount == 0) 0 else ((currentPage - 1) * rowsPerPage) + 1
+        val pageEnd = (pageStart + visibleCount - 1).coerceAtLeast(0)
+        countLabel.text = if (knownTotal != null && knownTotal >= 0) {
+            "$pageStart–$pageEnd of $knownTotal"
+        } else if (visibleCount > 0) {
+            "$visibleCount entries"
+        } else {
+            ""
+        }
+        previousPageButton.isEnabled = currentPage > 1
+        nextPageButton.isEnabled = hasNextPage
+        pageLabel.text = "Page $currentPage"
+        pageSizeCombo.selectedItem = rowsPerPage
+    }
+
+    private fun buildQueryKey(query: DependencyQuery): String =
+        listOf(query.search.trim(), query.page, query.rowsPerPage, query.sortColumn, query.order).joinToString("|")
+}
+
+private class DependencyDetailsPanel : JPanel() {
+    private val emptyLabel = JBLabel("Select a dependency to view details").apply {
+        foreground = JBColor.GRAY
+        alignmentX = LEFT_ALIGNMENT
+    }
+    private val nameLabel = JBLabel("").apply {
+        font = font.deriveFont(Font.BOLD, 15f)
+        alignmentX = LEFT_ALIGNMENT
+    }
+    private val versionLabel = JBLabel("").apply { foreground = JBColor.GRAY; alignmentX = LEFT_ALIGNMENT }
+    private val ecosystemLabel = JBLabel("").apply { foreground = JBColor.GRAY; alignmentX = LEFT_ALIGNMENT }
+    private val scopeLabel = JBLabel("").apply { alignmentX = LEFT_ALIGNMENT }
+    private val licensesLabel = JBLabel("").apply { alignmentX = LEFT_ALIGNMENT }
+    private val vulnLabel = JBLabel("").apply { alignmentX = LEFT_ALIGNMENT }
+    private val latestVersionLabel = JBLabel("").apply { foreground = JBColor.GRAY; alignmentX = LEFT_ALIGNMENT }
+    private val linkLabel = JBLabel("Open ↗").apply {
+        foreground = JBColor.BLUE
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        alignmentX = LEFT_ALIGNMENT
+        isVisible = false
+    }
+    private var currentLink: String? = null
+    private val detailRows = mutableListOf<JComponent>()
+
+    init {
+        layout = BoxLayout(this, BoxLayout.Y_AXIS)
+        border = JBUI.Borders.compound(
+            JBUI.Borders.customLine(JBColor.border()),
+            JBUI.Borders.empty(12)
+        )
+        add(emptyLabel)
+        listOf(nameLabel, versionLabel, ecosystemLabel, scopeLabel, licensesLabel, vulnLabel, latestVersionLabel, linkLabel)
+            .forEach { label ->
+                detailRows += label
+                add(Box.createVerticalStrut(4))
+                add(label)
+            }
+        linkLabel.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(event: MouseEvent) {
+                currentLink?.let { com.intellij.ide.BrowserUtil.browse(it) }
+            }
+        })
+        renderEmpty()
+    }
+
+    fun setItem(item: DependencyItem?) {
+        if (item == null) { renderEmpty(); return }
+        emptyLabel.isVisible = false
+        detailRows.forEach { it.isVisible = true }
+        nameLabel.text = item.name
+        versionLabel.text = "Version: ${item.version.ifBlank { "unknown" }}"
+        ecosystemLabel.text = "Ecosystem: ${item.ecosystem ?: "Unknown"}"
+        scopeLabel.text = "Scope: ${if (item.isIndirect) "Transitive" else "Direct"}"
+        licensesLabel.text = "Licenses: ${item.licenses.joinToString(", ").ifBlank { "None detected" }}"
+        val vulnCount = item.vulnerabilityCount
+        vulnLabel.text = when (vulnCount) {
+            0 -> "Vulnerabilities: None"
+            1 -> "Vulnerabilities: 1"
+            else -> "Vulnerabilities: $vulnCount"
+        }
+        vulnLabel.foreground = if (vulnCount > 0) JBColor(0xD32F2F, 0xFF7070) else JBColor.GRAY
+        latestVersionLabel.text = item.latestVersion?.takeIf { it.isNotBlank() }?.let { "Latest: $it" } ?: ""
+        latestVersionLabel.isVisible = latestVersionLabel.text.isNotBlank()
+        currentLink = item.link
+        linkLabel.isVisible = !item.link.isNullOrBlank()
+        revalidate(); repaint()
+    }
+
+    private fun renderEmpty() {
+        emptyLabel.isVisible = true
+        detailRows.forEach { it.isVisible = false }
+        currentLink = null
+        revalidate(); repaint()
     }
 }
+
+
+

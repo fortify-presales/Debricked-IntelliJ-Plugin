@@ -8,6 +8,8 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.project.Project
+import java.net.ConnectException
+import java.net.SocketTimeoutException
 
 @Service(Service.Level.PROJECT)
 class DebrickedPluginManager(private val project: Project) {
@@ -76,7 +78,8 @@ class DebrickedPluginManager(private val project: Project) {
         }
 
         synchronized(refreshLock) {
-            if (!forceRefresh && findingsState == FindingsState.LOADING && request == activeRefreshRequest) {
+            // Collapse duplicate requests while one identical refresh is already in-flight.
+            if (findingsState == FindingsState.LOADING && request == activeRefreshRequest) {
                 return
             }
             activeRefreshRequest = request
@@ -120,6 +123,36 @@ class DebrickedPluginManager(private val project: Project) {
                     return@executeOnPooledThread
                 }
                 notifyListeners(pageResult, findingsState)
+            } catch (e: SocketTimeoutException) {
+                LOG.warn("Timeout while refreshing findings: ${e.message}")
+                val shouldPublish = synchronized(refreshLock) {
+                    if (activeRefreshRequest == request) {
+                        activeRefreshRequest = null
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (!shouldPublish) {
+                    return@executeOnPooledThread
+                }
+                findingsState = FindingsState.TIMEOUT
+                notifyListeners(currentPageResult, FindingsState.TIMEOUT)
+            } catch (e: ConnectException) {
+                LOG.warn("Connection error while refreshing findings: ${e.message}")
+                val shouldPublish = synchronized(refreshLock) {
+                    if (activeRefreshRequest == request) {
+                        activeRefreshRequest = null
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (!shouldPublish) {
+                    return@executeOnPooledThread
+                }
+                findingsState = FindingsState.TIMEOUT
+                notifyListeners(currentPageResult, FindingsState.TIMEOUT)
             } catch (e: Exception) {
                 LOG.error("Failed to refresh findings: ${e.message}", e)
                 currentFindings = emptyList()

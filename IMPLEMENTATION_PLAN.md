@@ -4,8 +4,8 @@
 
 This document provides a concrete, phased implementation plan for the Debricked IntelliJ IDEA plugin. The plugin integrates Fortify Software Composition Analysis (Debricked) directly into JetBrains IDEs to display open-source vulnerability findings, dependencies, and license information in real-time as developers code.
 
-The implementation is divided into six phases using a **vertical-slice model** where each tab phase is not complete until both list and meaningful details are delivered:
-- **Phase 1** (Largely complete): Vulnerabilities tab foundation + shared repo/branch selector, tabbed architecture and caching
+The implementation is divided into six phases using a **vertical-slice model** where each phase is not complete until both list and meaningful details are delivered:
+- **Phase 1** (Complete): Vulnerabilities tab foundation + shared repo/branch selector, tab-based architecture and caching
 - **Phase 2** (Planned): Local scan orchestration via Debricked CLI
 - **Phase 3** (Planned): Dependencies tab (inventory + details)
 - **Phase 4** (Planned): Licenses tab (governance + details)
@@ -24,6 +24,22 @@ The Vulnerabilities tab now follows Debricked-style query behavior:
 4. Paging controls (prev/next + page size) drive backend requests.
 5. Count/status text follows server-backed paging semantics (showing range and total when available).
 6. Query results are cached by repository/branch/query key for responsive back/forward and repeated lookups.
+
+### Update: Vulnerabilities details enrichment + UI restructuring (2026-08-19)
+
+The Vulnerabilities tab implementation has been expanded and partially restructured to prepare for additional tab phases without blocking current delivery.
+
+1. Vulnerability details pane migrated to structured card/section rendering (Actions, CISA KEV, Introduced through, Suggested fixes, References).
+2. Additional Debricked detail endpoints are integrated in the details bundle path:
+   - `root-fixes`
+   - `vulnerable-timeline`
+   - `files`
+   - `references`
+   - `reachability-data`
+3. Details UI now includes advisory source cards (CWE/GitHub/NVD), review status action card, and conditional reachability card.
+4. Introduced-through and references sections are responsive and support narrow-width rendering.
+5. Local file navigation from vulnerability file cards was added, including lock-file remapping for generated Debricked lock files (for example `gradle.debricked.lock` -> `build.gradle`).
+6. Refactoring slices extracted reusable/common and vulnerability-specific code from `TabbedToolWindow.kt` into dedicated files (see updated file list below).
 
 ---
 
@@ -88,12 +104,8 @@ IntelliJ Project
    ├── Tab Data Providers (Per-Tab Orchestrators)
    │      ├── VulnerabilitiesTabProvider
    │      │    └── Fetches vulnerabilities via DebrickedApiClient
-   │      ├── DependenciesTabProvider
-   │      │    └── Fetches dependencies via DebrickedApiClient
-   │      ├── LicensesTabProvider
-   │      │    └── Fetches licenses via DebrickedApiClient
-   │      └── DashboardTabProvider
-   │           └── Aggregates counts from other providers
+   │      └── PassiveTabProvider
+   │           └── Hosts placeholder panels for Dashboard/Dependencies/Licenses until implemented
    │
    ├── DebrickedApiClient (App Service)
    │      ├── JWT authentication (token or username/password)
@@ -116,12 +128,11 @@ IntelliJ Project
    │      │     ├── Branch dropdown
    │      │     └── Repository refresh button
    │      │
-   │      ├── Tab Container (JTabbedPane / dynamic registration)
-   │      │     ├── Vulnerabilities Tab (Phase 1, always visible)
-   │      │     ├── Local Scan actions (Phase 2, same tool window context)
-   │      │     ├── Dependencies Tab (Phase 3, visible when implemented)
-   │      │     ├── Licenses Tab (Phase 4, visible when implemented)
-   │      │     └── Dashboard Tab (Phase 5, visible when implemented)
+   │      ├── Content Manager (tab registration)
+   │      │     ├── Vulnerabilities Tab (active implementation)
+   │      │     ├── Dashboard Tab (placeholder)
+   │      │     ├── Dependencies Tab (placeholder)
+   │      │     └── Licenses Tab (placeholder)
    │      │
    │      ├── Vulnerability Tab Content
    │      │     ├── Slim vertical action sidebar (Refresh, View options popup)
@@ -179,10 +190,10 @@ IntelliJ Project
 
 ```
 
-## Phase 1: Vulnerabilities Tab & Tabbed Architecture ✅ LARGELY COMPLETE
+## Phase 1: Vulnerabilities Tab & Tabbed Architecture ✅ COMPLETE
 
 ### Objectives (Clean Architecture First)
-- Implement tabbed tool window architecture (JTabbedPane + TabProvider pattern)
+- Implement tab-based tool window architecture (`ContentManager` + `TabProvider` pattern)
 - Build data cache layer (per-repository/branch, lazy-load, invalidation)
 - Create Vulnerabilities tab as first tab (flat sortable table)
 - Implement shared repository & branch selector (persistent across all tabs)
@@ -194,7 +205,7 @@ Building the tabbed infrastructure now ensures:
 - ✅ Clean, extensible architecture from the start
 - ✅ Easy to add Dashboard (Phase 2), Dependencies (Phase 3), Licenses (Phase 4) without major refactoring
 - ✅ Consistent UX across all tabs (shared header, lazy-load strategy, caching)
-- ✅ Single responsibility per tab (VulnerabilitiesTabProvider, DashboardTabProvider, etc.)
+- ✅ Single responsibility per tab provider (`VulnerabilitiesTabProvider` now, additional providers in later phases)
 - ✅ Reduced technical debt; no "refactor later" risk
 
 ### Status
@@ -207,7 +218,7 @@ Building the tabbed infrastructure now ensures:
 - ✅ MessageBus for cross-project notifications
 
 **Tabbed Architecture**
-- [x] Create `DebrickedToolWindowContent` with JTabbedPane
+- [x] Create `DebrickedTabbedToolWindowContent` with tab registration via `ContentFactory`/`ContentManager`
 - [x] Define `TabProvider` interface (loadData, invalidate, getPanel)
 - [x] Implement `DataCache` layer (cache key = repositoryId:branch:tabType)
 - [x] Build shared header panel (repo + branch selectors)
@@ -220,6 +231,12 @@ Building the tabbed infrastructure now ensures:
 - ✅ Sortable columns (Name, CVSS, Dependencies, Review Status)
 - ✅ Real-time search/filter (CVE name or dependency)
 - ✅ CVSS-to-Severity calculation (no API enum)
+- ✅ Card-based details pane sections (Actions, CISA KEV, Introduced through, Suggested fixes, References)
+- ✅ Advisory source cards (CWE/GitHub/NVD) with expandable details + links
+- ✅ Review workflow in details pane (status selector + apply action)
+- ✅ Reachability analysis card shown when analysis data exists
+- ✅ Local file opening from "Introduced through" file cards (IDE editor navigation)
+- ✅ Suggested fixes populated from root-fixes/timeline/files detail APIs
 - [x] Implement `VulnerabilitiesTabProvider` (extends TabProvider)
 - [x] Create vulnerability table panel (`JBTable` + custom grouping table model)
 - [x] Add vulnerability details pane (right side, master-detail layout via `JSplitPane`)
@@ -234,7 +251,7 @@ Building the tabbed infrastructure now ensures:
 ### Key Decisions Made
 
 1. **Tabbed Architecture**: All functionality (vulnerabilities, dependencies, licenses) in one tool window with tabs—not separate tool windows
-2. **Default Tab**: User-configurable (Dashboard default for new installs)
+2. **Default Tab**: User-configurable via settings
 3. **Shared Header**: Repository and branch selectors above tabs; header refresh is for repositories
 4. **Lazy Loading**: Only load the active tab; others load on-demand when selected
 5. **Caching**: Cache vulnerabilities/dependencies/licenses per `(repositoryId, branch)` tuple
@@ -259,12 +276,17 @@ Building the tabbed infrastructure now ensures:
 | `DebrickedCredentialStore.kt` | In-memory + PasswordSafe credential cache | ✅ Complete |
 | `DebrickedPluginManager.kt` | Project-level service, tab state & caching orchestration | ✅ Complete |
 | `DebrickedSettingsConfigurable.kt` | Settings UI (auth only) | ✅ Complete |
-| `DebrickedToolWindowFactory.kt` | Tool window factory (creates tabbed content) | ✅ Complete |
+| `DebrickedToolWindowFactory.kt` | Tool window factory (registers tool window content tabs) | ✅ Complete |
 | `Panels.kt` | Legacy panels (auth/repository prompts, reference severity tree) | ✅ Retained |
-| `TabbedToolWindow.kt` | Tabbed UI: header selectors, sidebar toolbar, table, options popup, details pane | ✅ Complete |
+| `TabbedToolWindow.kt` | Tool window shell/orchestration + Vulnerabilities tab integration + details pane integration | ✅ Active (being reduced via extraction) |
+| `ui/common/PlaceholderTabPanel.kt` | Reusable placeholder panel for unimplemented tabs | ✅ Extracted |
+| `ui/common/ToolWindowContextHeader.kt` | Shared repository/branch header UI + action classes + controller interface | ✅ Extracted |
+| `ui/vulnerability/VulnerabilityFormatting.kt` | Pure formatting helpers for vulnerability presentation | ✅ Extracted |
+| `ui/vulnerability/VulnerabilityTableModel.kt` | Vulnerability table model (sorting/filtering/grouping rows) | ✅ Extracted |
+| `ui/vulnerability/VulnerabilityRenderers.kt` | Vulnerability table renderers/icons (CVSS, Name, alignment, severity shield) | ✅ Extracted |
 | `Models.kt` | Domain: Severity (computed from CVSS), VulnerabilityFinding, FindingsState | ✅ Complete |
 | `DebrickedSettingsNotifier.kt` | MessageBus topic for settings changes | ✅ Complete |
-| `TabProvider.kt` | Interface + `VulnerabilitiesTabProvider` implementation | ✅ Complete |
+| `TabProvider.kt` | Interface + `VulnerabilitiesTabProvider` + `PassiveTabProvider` | ✅ Complete |
 | `DataCache.kt` | Per-repository/branch cache with invalidation | ✅ Complete |
 
 ### UI Layout (Phase 1)
@@ -273,10 +295,10 @@ Building the tabbed infrastructure now ensures:
 
 | Area | Content |
 |------|---------|
-| Tabs | Dynamic: only implemented tabs are shown by default |
+| Tabs | Dashboard, Vulnerabilities, Dependencies, Licenses are visible; unimplemented tabs display placeholders |
 | Shared header | `Repository: [payment-service ▼]` `Branch: [main ▼]` `[↺ Refresh]` |
 | Active tab in Phase 1 | `Vulnerabilities` |
-| Inactive tabs in Phase 1 | Hidden by default; optional preview toggle may expose planned tabs |
+| Unimplemented tabs in Phase 1 | Placeholder content until each tab phase is implemented |
 
 **Vulnerabilities tab layout**
 
@@ -302,10 +324,10 @@ Building the tabbed infrastructure now ensures:
 
 **Tab visibility policy**
 
-- Show only implemented tabs by default.
-- Hide placeholder-only tabs to avoid dead-end UX.
-- Optional internal/testing flag: **Show preview tabs**.
-- Default tab fallback: if saved default tab is unavailable, fall back to Vulnerabilities.
+- All tabs are visible in the tool window.
+- Unimplemented tabs display placeholder content until their phase is delivered.
+- Repository/branch context remains shared across all tabs.
+- Active data loading is currently implemented for Vulnerabilities; other tabs remain passive.
 
 ### Settings Panel
 
@@ -321,10 +343,10 @@ Access Token:         [________________________]  (disabled if user/pass selecte
 ### Key Technical Decisions
 
 **Tabbed Architecture**:
-- Single tool window with JTabbedPane (not separate tool windows)
+- Single tool window with `ContentManager`-registered tabs (not separate tool windows)
 - Shared header (repo/branch) above tabs; changes propagate to all tabs
 - TabProvider interface for clean separation of concerns
-- Vulnerabilities tab as Phase 1; other tabs placeholder (Phases 2+)
+- Vulnerabilities tab is actively implemented in Phase 1; other tabs remain placeholders (Phases 2+)
 
 **Data Caching**:
 - Cache key: `repositoryId:branch:tabType` (e.g., "123:main:vulnerabilities")
@@ -354,6 +376,13 @@ Access Token:         [________________________]  (disabled if user/pass selecte
 - Default hidden columns: Reachable Path, Exploited (CISA)
 - Sorting and grouping are chosen from the View options popup; sorting defaults to CVSS descending
 - Group By supports Dependencies, Reachable path, Review status, Exploited (CISA), or None
+
+**Details Pane Enrichment (2026-08-19)**:
+- Sections are rendered as cards with consistent spacing/borders for easier scanning
+- References use responsive columns (1/2/3 based on available width)
+- Introduced-through section renders manifest/file cards and dependency paths
+- Suggested fixes section uses root fix + timeline context
+- Actions/CISA KEV cards centralize review and exploitability context
 
 ---
 
@@ -604,7 +633,7 @@ These rules were established while aligning the plugin with native IntelliJ tool
 - Show `Loading…` status text rather than blanking the table when data is being fetched for the **same** context.
 - Preserve currently visible findings during a same-context refresh to avoid flicker.
 - Defer findings loads until repository **and** branch context exist; ignore duplicate reselections.
-- Only the active tab loads on startup; other tabs load lazily on first selection.
+- Only the active tab loads on tool window startup; other tabs load lazily on first selection.
 
 ---
 
@@ -985,8 +1014,8 @@ class VulnerabilityFindingTest {
 | Thread pool instead of GlobalScope | IntelliJ environment does not reliably execute `GlobalScope.launch` with blocking HTTP; thread pool respects IDE's scheduling |
 | Theme-aware colors (JBColor) | Automatic light/dark theme support; maintainable color scheme |
 | `LOADING` state | Immediately clears old findings so user sees "Loading…" rather than stale results during branch/repo change |
-| **Tabbed architecture (Phase 1+)** | Separates distinct workflows (vulnerabilities, dependencies, licenses); each tab can evolve independently; matches common IntelliJ patterns |
-| Vulnerabilities as default tab | MVP focuses on security; users expect vulnerabilities first; Dashboard later once mature |
+| **Tab-based architecture (Phase 1+)** | Separates distinct workflows (vulnerabilities, dependencies, licenses); each tab can evolve independently; matches common IntelliJ patterns |
+| User-configurable default tab | Startup tab is user-controlled in settings; allows teams to prioritize their workflow |
 | Lazy-load tabs | Keep tool window fast; load only active tab; other tabs load on-demand |
 | Cache by (repositoryId, branch) | Fast switching between repos/branches without re-fetching; invalidate when context changes |
 | Real-time search/filter | Faster than modal dialog filters; users can instantly narrow to CVEs matching name or dependency |
@@ -1015,7 +1044,7 @@ class VulnerabilityFindingTest {
 2. Simple fallback: if selected branch has no scan → show default branch
 3. Reachable Path is a heuristic mapping of `reachabilityAnalysis` / `reachAnalysisMessage`; refine when the API semantics are documented
 4. `cisaKevExploited` blank is treated as "No"; blank vs unknown is not distinguished
-5. Column visibility / sort / group choices are not yet persisted across IDE restarts
+5. Column visibility / sort / group choices are persisted across IDE restarts
 6. Repository search is client-side; very large orgs still need server-side paging/search
 
 **Phase 6+ (Commit-Level Investigation)**:
@@ -1121,31 +1150,26 @@ Phase 1 DataCache must support:
 - Settings accessible
 
 **Target State (Phase 1, complete)**:
-- JTabbedPane with 4 tabs (Dashboard, Vulnerabilities, Dependencies, Licenses)
+- `ContentManager` registering 4 tabs (Dashboard, Vulnerabilities, Dependencies, Licenses)
 - Shared header (repo/branch selector) above tabs
-- Vulnerabilities tab as default
+- User-configurable default tab
 - Other tabs lazy-load
 
 ### Refactoring Steps
 
-**Step 1: Create Tab Container**
+**Step 1: Create Tab Content Registration**
 ```kotlin
-class DebrickedToolWindowContent : JPanel() {
-    private val tabbedPane = JTabbedPane()
-    
-    init {
-        // Build shared header (repo + branch selector)
-        val headerPanel = buildHeaderPanel()
-        
-        // Add tabs
-        tabbedPane.addTab("Vulnerabilities", VulnerabilitiesTabPanel())
-        tabbedPane.addTab("Dashboard", DashboardTabPanel()) 
-        tabbedPane.addTab("Dependencies", DependenciesTabPanel())
-        tabbedPane.addTab("Licenses", LicensesTabPanel())
-        
-        layout = BorderLayout()
-        add(headerPanel, BorderLayout.NORTH)
-        add(tabbedPane, BorderLayout.CENTER)
+class DebrickedTabbedToolWindowContent(
+    private val toolWindow: ToolWindow
+) {
+    private fun installContents() {
+        val contentFactory = ContentFactory.getInstance()
+        toolWindow.contentManager.removeAllContents(true)
+
+        addTabContent(contentFactory, "Dashboard", dashboardPanel)
+        addTabContent(contentFactory, "Vulnerabilities", vulnerabilitiesPanel)
+        addTabContent(contentFactory, "Dependencies", dependenciesPanel)
+        addTabContent(contentFactory, "Licenses", licensesPanel)
     }
 }
 ```

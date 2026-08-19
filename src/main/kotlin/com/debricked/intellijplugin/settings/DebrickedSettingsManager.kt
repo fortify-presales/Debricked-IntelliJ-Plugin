@@ -30,7 +30,14 @@ data class DebrickedProjectSettings(
     var defaultBranch: String? = null,
     var selectedBranchId: String = "",
     var selectedBranchName: String = "",
-    var defaultTab: DebrickedDefaultTab = DebrickedDefaultTab.DASHBOARD
+    var defaultTab: DebrickedDefaultTab = DebrickedDefaultTab.DASHBOARD,
+    var vulnerabilitiesVisibleColumns: String = "",
+    var vulnerabilitiesSortMode: String = "CVSS",
+    var vulnerabilitiesGroupMode: String = "NONE",
+    var vulnerabilitiesSearchText: String = "",
+    var vulnerabilitiesRowsPerPage: Int = 25,
+    var vulnerabilitiesDividerLocation: Int = -1,
+    var recentRepositoryIds: String = ""
 )
 
 @Service(Service.Level.APP)
@@ -109,6 +116,57 @@ class DebrickedSettingsManager :
 
     fun setDefaultTab(defaultTab: DebrickedDefaultTab) {
         settings.defaultTab = defaultTab
+    }
+
+    fun getVulnerabilitiesVisibleColumns(): String = settings.vulnerabilitiesVisibleColumns
+
+    fun setVulnerabilitiesVisibleColumns(value: String) {
+        settings.vulnerabilitiesVisibleColumns = value
+    }
+
+    fun getVulnerabilitiesSortMode(): String = settings.vulnerabilitiesSortMode
+
+    fun setVulnerabilitiesSortMode(value: String) {
+        settings.vulnerabilitiesSortMode = value
+    }
+
+    fun getVulnerabilitiesGroupMode(): String = settings.vulnerabilitiesGroupMode
+
+    fun setVulnerabilitiesGroupMode(value: String) {
+        settings.vulnerabilitiesGroupMode = value
+    }
+
+    fun getVulnerabilitiesSearchText(): String = settings.vulnerabilitiesSearchText
+
+    fun setVulnerabilitiesSearchText(value: String) {
+        settings.vulnerabilitiesSearchText = value
+    }
+
+    fun getVulnerabilitiesRowsPerPage(): Int = settings.vulnerabilitiesRowsPerPage
+
+    fun setVulnerabilitiesRowsPerPage(value: Int) {
+        settings.vulnerabilitiesRowsPerPage = value
+    }
+
+    fun getVulnerabilitiesDividerLocation(): Int = settings.vulnerabilitiesDividerLocation
+
+    fun setVulnerabilitiesDividerLocation(value: Int) {
+        settings.vulnerabilitiesDividerLocation = value
+    }
+
+    fun getRecentRepositoryIds(): List<String> = settings.recentRepositoryIds
+        .split(',')
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+
+    fun pushRecentRepositoryId(repositoryId: String) {
+        val id = repositoryId.trim()
+        if (id.isBlank()) return
+        val updated = buildList {
+            add(id)
+            addAll(getRecentRepositoryIds().filter { it != id })
+        }.take(50)
+        settings.recentRepositoryIds = updated.joinToString(",")
     }
 
     fun isConfigured(): Boolean {

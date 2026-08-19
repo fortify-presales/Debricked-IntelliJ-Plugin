@@ -45,7 +45,7 @@ data class SeverityGroupNode(val severity: Severity, val count: Int)
 data class FindingNode(val finding: VulnerabilityFinding)
 
 /** Repository identifier used in the toolbar combo. */
-internal data class RepositoryChoice(
+data class RepositoryChoice(
     val id: String,
     val name: String,
     val organizationId: String,
@@ -272,6 +272,7 @@ class DebrickedFindingsPanel(
             FindingsState.LOADING                  -> "Loading…"
             FindingsState.CURRENT                  -> "${findings.size} findings · ${now()}"
             FindingsState.NO_REMOTE_RESULTS        -> "No findings · ${now()}"
+            FindingsState.TIMEOUT                  -> "${findings.size} findings · request timed out"
             FindingsState.STALE_DEPENDENCY_CHANGES -> "${findings.size} findings · local changes detected"
             FindingsState.STALE_COMMIT             -> "${findings.size} findings · latest branch results"
         }
@@ -288,6 +289,7 @@ class DebrickedFindingsPanel(
     private fun buildContent(): JComponent = when (state) {
         FindingsState.LOADING -> buildLoadingPanel()
         FindingsState.NO_REMOTE_RESULTS -> buildEmptyPanel()
+        FindingsState.TIMEOUT -> buildFindingsTree()
         else -> buildFindingsTree()
     }
 
