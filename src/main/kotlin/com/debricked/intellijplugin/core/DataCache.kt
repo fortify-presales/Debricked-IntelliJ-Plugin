@@ -52,12 +52,19 @@ class DataCache {
 
     fun invalidate(repositoryId: String, branchId: String? = null) {
         synchronized(lock) {
-            val prefix = if (branchId.isNullOrBlank()) {
-                "$repositoryId:"
-            } else {
-                "$repositoryId:$branchId"
+            if (branchId.isNullOrBlank()) {
+                val repositoryPrefix = "$repositoryId:"
+                cache.keys.removeAll { it.startsWith(repositoryPrefix) }
+                return
             }
-            cache.keys.removeAll { it.startsWith(prefix) }
+
+            val basePrefix = "$repositoryId:$branchId"
+            // Match exact branch namespace boundaries only:
+            // - "$repo:$branch:$tab" for non-query keys
+            // - "$repo:$branch|$query:$tab" for query keys
+            cache.keys.removeAll { key ->
+                key.startsWith("$basePrefix:") || key.startsWith("$basePrefix|")
+            }
         }
     }
 
@@ -85,9 +92,7 @@ class DependencyCache(private val cache: DataCache = DataCache()) {
     }
 
     fun clear() {
-        synchronized(Any()) {
-            cache.clear()
-        }
+        cache.clear()
     }
 }
 
